@@ -1,0 +1,509 @@
+# ============================================================================
+# STEGANOGRAPHY TOOL - FERRAMENTA DE ESTEGANOGRAFIA
+# Esconde dados em imagens (PNG) e áudio (WAV) usando LSB + AES
+# ============================================================================
+
+import os
+import sys
+import struct
+import hashlib
+import base64
+import wave
+from typing import Tuple, Optional, List, Dict
+from dataclasses import dataclass
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from PIL import Image
+import numpy as np
+
+# ============================================================================
+# CONFIGURAÇÃO E UTILITÁRIOS
+# ============================================================================
+
+class CryptoUtils:
+    """Utilitários criptográficos para proteção dos dados"""
+    
+    @staticmethod
+    def derive_key(password: str, salt: bytes = None) -> Tuple[bytes, bytes]:
+        """Deriva chave AES a partir da senha"""
+        if salt is None:
+            salt = os.urandom(16)
+        key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000, 32)
+        return key, salt
+    
+    @staticmethod
+    def encrypt_data(data: bytes, password: str) -> Tuple[bytes, bytes, bytes]:
+        """Cifra dados com AES-256-GCM"""
+        key, salt = CryptoUtils.derive_key(password)
+        iv = os.urandom(12)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        ciphertext, tag = cipher.encrypt_and_digest(data)
+        return ciphertext, iv, tag, salt
+    
+    @staticmethod
+    def decrypt_data(ciphertext: bytes, password: str, iv: bytes, tag: bytes, salt: bytes) -> bytes:
+        """Decifra dados com AES-256-GCM"""
+        key, _ = CryptoUtils.derive_key(password, salt)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+        return plaintext
+    
+    @staticmethod
+    def hash_file(filepath: str) -> str:
+        """Calcula hash SHA-256 do arquivo"""
+        sha256 = hashlib.sha256()
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+
+# ============================================================================
+# LSB (LEAST SIGNIFICANT BIT) IMPLEMENTATION
+# ============================================================================
+
+class LSBEncoder:
+    """Codificação e decodificação LSB para imagens"""
+    
+    @staticmethod
+    def encode_bytes(data: bytes, bits_per_byte: int = 1) -> List[int]:
+        """Converte bytes em lista de bits LSB"""
+        bits = []
+        for byte in data:
+            for i in range(bits_per_byte):
+                bits.append((byte >> (7 - i)) & 1)
+        return bits
+    
+    @staticmethod
+    def decode_bytes(bits: List[int], bits_per_byte: int = 1) -> bytes:
+        """Converte bits LSB de volta para bytes"""
+        data = bytearray()
+        for i in range(0, len(bits), bits_per_byte):
+            byte = 0
+            for j in range(bits_per_byte):
+                if i + j < len(bits):
+                    byte = (byte << 1) | bits[i + j]
+            data.append(byte)
+        return bytes(data)
+    
+    @staticmethod
+    def bits_available(width: int, height: int, channels: int, bits_per_pixel: int = 1) -> int:
+        """Calcula capacidade máxima de bits na imagem"""
+        total_pixels = width * height * channels
+        return total_pixels // bits_per_pixel
+
+
+# ============================================================================
+# ESTEGANOGRAFIA EM PNG
+# ============================================================================
+
+class PNGSteganography:
+    """Esconde e extrai dados em imagens PNG usando LSB"""
+    
+    # Magic bytes para identificar dados escondidos
+    MAGIC_HEADER = b'STEGv1'
+    HEADER_SIZE = 16  # Magic (6) + tamanho (4) + flags (2) + reservado (4)
+    
+    def __init__(self, password: str = None):
+        self.password = password
+    
+    def hide_data(self, image_path: str, output_path: str, data: bytes) -> bool:
+        """
+        Esconde dados em imagem PNG
+        Estrutura: [MAGIC_HEADER(16)][tamanho_dados_cifrados(4)][dados_cifrados]
+        """
+        # Preparar dados
+        if self.password:
+            ciphertext, iv, tag, salt = CryptoUtils.encrypt_data(data, self.password)
+            payload = self.MAGIC_HEADER + iv + tag + salt + len(ciphertext).to_bytes(4, 'big') + ciphertext
+        else:
+            payload = self.MAGIC_HEADER + len(data).to_bytes(4, 'big') + data
+        
+        # Carregar imagem
+        img = Image.open(image_path)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        width, height = img.size
+        pixels = np.array(img, dtype=np.uint8)
+        
+        # Calcular capacidade
+        available_bits = width * height * 3  # 3 canais RGB
+        required_bits = len(payload) * 8
+        
+        if required_bits > available_bits:
+            raise ValueError(f"Arquivo muito grande! Capacidade: {available_bits//8} bytes, Necessário: {required_bits//8} bytes")
+        
+        # Esconder dados nos bits menos significativos
+        bits = LSBEncoder.encode_bytes(payload, 1)
+        flat_pixels = pixels.reshape(-1)
+        
+        for i, bit in enumerate(bits):
+            if i >= len(flat_pixels):
+                break
+            # Modificar apenas o bit menos significativo
+            flat_pixels[i] = (flat_pixels[i] & 0xFE) | bit
+        
+        # Salvar imagem resultante
+        pixels = flat_pixels.reshape(height, width, 3)
+        output_img = Image.fromarray(pixels, mode='RGB')
+        output_img.save(output_path, 'PNG')
+        
+        print(f"[+] Dados escondidos em: {output_path}")
+        print(f"[+] Tamanho dos dados: {len(data)} bytes")
+        print(f"[+] Capacidade usada: {required_bits//8} / {available_bits//8} bytes")
+        
+        return True
+    
+    def extract_data(self, image_path: str) -> Optional[bytes]:
+        """Extrai dados escondidos de imagem PNG"""
+        img = Image.open(image_path)
+        pixels = np.array(img, dtype=np.uint8).reshape(-1)
+        
+        # Extrair bits LSB
+        bits = [pixel & 1 for pixel in pixels]
+        
+        # Converter bits para bytes
+        raw_data = LSBEncoder.decode_bytes(bits, 1)
+        
+        # Procurar magic header
+        magic_pos = raw_data.find(self.MAGIC_HEADER)
+        if magic_pos == -1:
+            raise ValueError("Nenhum dado esteganográfico encontrado!")
+        
+        # Extrair dados
+        header_end = magic_pos + len(self.MAGIC_HEADER)
+        
+        if self.password:
+            # Formato com senha: iv(12) + tag(16) + salt(16) + size(4) + ciphertext
+            iv = raw_data[header_end:header_end+12]
+            tag = raw_data[header_end+12:header_end+28]
+            salt = raw_data[header_end+28:header_end+44]
+            data_size = int.from_bytes(raw_data[header_end+44:header_end+48], 'big')
+            ciphertext = raw_data[header_end+48:header_end+48+data_size]
+            
+            plaintext = CryptoUtils.decrypt_data(ciphertext, self.password, iv, tag, salt)
+            return plaintext
+        else:
+            # Sem senha
+            data_size = int.from_bytes(raw_data[header_end:header_end+4], 'big')
+            extracted = raw_data[header_end+4:header_end+4+data_size]
+            return extracted
+    
+    def hide_file(self, image_path: str, output_path: str, file_path: str) -> bool:
+        """Esconde um arquivo dentro da imagem"""
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        filename = os.path.basename(file_path).encode()
+        payload = len(filename).to_bytes(2, 'big') + filename + data
+        return self.hide_data(image_path, output_path, payload)
+    
+    def extract_to_file(self, image_path: str, output_path: str) -> bool:
+        """Extrai arquivo da imagem"""
+        data = self.extract_data(image_path)
+        if data:
+            # Extrair nome do arquivo
+            filename_len = int.from_bytes(data[:2], 'big')
+            filename = data[2:2+filename_len].decode()
+            file_data = data[2+filename_len:]
+            
+            full_output = os.path.join(output_path, filename) if os.path.isdir(output_path) else output_path
+            with open(full_output, 'wb') as f:
+                f.write(file_data)
+            print(f"[+] Arquivo extraído: {full_output}")
+            return True
+        return False
+
+
+# ============================================================================
+# ESTEGANOGRAFIA EM WAV
+# ============================================================================
+
+class WAVSteganography:
+    """Esconde e extrai dados em arquivos WAV usando LSB"""
+    
+    MAGIC_HEADER = b'STEGv1'
+    
+    def __init__(self, password: str = None):
+        self.password = password
+    
+    def hide_data(self, wav_path: str, output_path: str, data: bytes) -> bool:
+        """Esconde dados em arquivo WAV"""
+        # Preparar dados
+        if self.password:
+            ciphertext, iv, tag, salt = CryptoUtils.encrypt_data(data, self.password)
+            payload = self.MAGIC_HEADER + iv + tag + salt + len(ciphertext).to_bytes(4, 'big') + ciphertext
+        else:
+            payload = self.MAGIC_HEADER + len(data).to_bytes(4, 'big') + data
+        
+        # Ler arquivo WAV
+        with wave.open(wav_path, 'rb') as wav:
+            params = wav.getparams()
+            frames = wav.readframes(wav.getnframes())
+        
+        # Converter frames para array de bytes
+        samples = bytearray(frames)
+        available_bits = len(samples) * 8
+        required_bits = len(payload) * 8
+        
+        if required_bits > available_bits:
+            raise ValueError(f"Dados grandes demais! Capacidade: {available_bits//8} bytes, Necessário: {required_bits//8} bytes")
+        
+        # Esconder dados nos bits menos significativos
+        bits = LSBEncoder.encode_bytes(payload, 1)
+        
+        for i, bit in enumerate(bits):
+            if i >= len(samples):
+                break
+            samples[i] = (samples[i] & 0xFE) | bit
+        
+        # Salvar novo arquivo WAV
+        with wave.open(output_path, 'wb') as output_wav:
+            output_wav.setparams(params)
+            output_wav.writeframes(bytes(samples))
+        
+        print(f"[+] Dados escondidos em: {output_path}")
+        print(f"[+] Tamanho dos dados: {len(data)} bytes")
+        print(f"[+] Capacidade usada: {required_bits//8} / {available_bits//8} bytes")
+        
+        return True
+    
+    def extract_data(self, wav_path: str) -> Optional[bytes]:
+        """Extrai dados escondidos de arquivo WAV"""
+        with wave.open(wav_path, 'rb') as wav:
+            frames = wav.readframes(wav.getnframes())
+        
+        samples = bytearray(frames)
+        bits = [sample & 1 for sample in samples]
+        raw_data = LSBEncoder.decode_bytes(bits, 1)
+        
+        # Procurar magic header
+        magic_pos = raw_data.find(self.MAGIC_HEADER)
+        if magic_pos == -1:
+            raise ValueError("Nenhum dado esteganográfico encontrado!")
+        
+        header_end = magic_pos + len(self.MAGIC_HEADER)
+        
+        if self.password:
+            iv = raw_data[header_end:header_end+12]
+            tag = raw_data[header_end+12:header_end+28]
+            salt = raw_data[header_end+28:header_end+44]
+            data_size = int.from_bytes(raw_data[header_end+44:header_end+48], 'big')
+            ciphertext = raw_data[header_end+48:header_end+48+data_size]
+            
+            plaintext = CryptoUtils.decrypt_data(ciphertext, self.password, iv, tag, salt)
+            return plaintext
+        else:
+            data_size = int.from_bytes(raw_data[header_end:header_end+4], 'big')
+            extracted = raw_data[header_end+4:header_end+4+data_size]
+            return extracted
+    
+    def hide_file(self, wav_path: str, output_path: str, file_path: str) -> bool:
+        """Esconde um arquivo dentro do áudio"""
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        filename = os.path.basename(file_path).encode()
+        payload = len(filename).to_bytes(2, 'big') + filename + data
+        return self.hide_data(wav_path, output_path, payload)
+    
+    def extract_to_file(self, wav_path: str, output_path: str) -> bool:
+        """Extrai arquivo do áudio"""
+        data = self.extract_data(wav_path)
+        if data:
+            filename_len = int.from_bytes(data[:2], 'big')
+            filename = data[2:2+filename_len].decode()
+            file_data = data[2+filename_len:]
+            
+            full_output = os.path.join(output_path, filename) if os.path.isdir(output_path) else output_path
+            with open(full_output, 'wb') as f:
+                f.write(file_data)
+            print(f"[+] Arquivo extraído: {full_output}")
+            return True
+        return False
+
+
+# ============================================================================
+# FERRAMENTA COMPARAÇÃO DE IMAGENS
+# ============================================================================
+
+class ImageComparator:
+    """Compara imagens original e modificada para análise esteganográfica"""
+    
+    @staticmethod
+    def compare(image1_path: str, image2_path: str) -> Dict:
+        """Compara duas imagens e retorna diferenças"""
+        img1 = Image.open(image1_path).convert('RGB')
+        img2 = Image.open(image2_path).convert('RGB')
+        
+        pixels1 = np.array(img1, dtype=np.int16)
+        pixels2 = np.array(img2, dtype=np.int16)
+        
+        diff = np.abs(pixels1 - pixels2)
+        
+        stats = {
+            'max_diff': int(np.max(diff)),
+            'mean_diff': float(np.mean(diff)),
+            'pixels_changed': int(np.sum(diff > 0)),
+            'total_pixels': pixels1.size,
+            'percentage_changed': 100 * np.sum(diff > 0) / pixels1.size
+        }
+        
+        # Criar imagem de diferença
+        diff_img = Image.fromarray((diff * 10).clip(0, 255).astype(np.uint8))
+        
+        return stats, diff_img
+
+
+# ============================================================================
+# INTERFACE PRINCIPAL
+# ============================================================================
+
+def print_banner():
+    banner = r"""
+    ╔═══════════════════════════════════════════════════════════════════════╗
+    ║                                                                       ║
+    ║    ███████╗████████╗███████╗ ██████╗  █████╗ ███╗   ██╗               ║
+    ║    ██╔════╝╚══██╔══╝██╔════╝██╔════╝ ██╔══██╗████╗  ██║               ║
+    ║    ███████╗   ██║   █████╗  ██║  ███╗███████║██╔██╗ ██║               ║
+    ║    ╚════██║   ██║   ██╔══╝  ██║   ██║██╔══██║██║╚██╗██║               ║
+    ║    ███████║   ██║   ███████╗╚██████╔╝██║  ██║██║ ╚████║               ║
+    ║    ╚══════╝   ╚═╝   ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝               ║
+    ║                                                                       ║
+    ║                    TOOL DE ESTEGANOGRAFIA v1.0                        ║
+    ║             Esconda dados em PNG e WAV usando LSB + AES               ║
+    ╚═══════════════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
+
+def main():
+    print_banner()
+    
+    print("🔧 Verificando dependências...")
+    try:
+        from PIL import Image
+        import numpy as np
+        print("[+] PIL (Pillow) OK")
+        print("[+] NumPy OK")
+    except ImportError as e:
+        print(f"[-] Erro: {e}")
+        print("Instale com: pip install pillow numpy pycryptodome")
+        return
+    
+    print("\n" + "-" * 60)
+    print("   MODO DE OPERAÇÃO")
+    print("-" * 60)
+    print("[1] PNG - Esconder texto")
+    print("[2] PNG - Extrair texto")
+    print("[3] PNG - Esconder arquivo")
+    print("[4] PNG - Extrair arquivo")
+    print("[5] PNG - Comparar imagens (análise)")
+    print("[6] WAV - Esconder texto")
+    print("[7] WAV - Extrair texto")
+    print("[8] WAV - Esconder arquivo")
+    print("[9] WAV - Extrair arquivo")
+    print("[0] Sair")
+    print("-" * 60)
+    
+    op = input("Escolha: ").strip()
+    
+    if op == "0":
+        return
+    
+    use_password = input("Usar senha para proteger os dados? (s/N): ").strip().lower()
+    password = None
+    if use_password == 's':
+        password = input("Senha: ").strip()
+        confirm = input("Confirmar senha: ").strip()
+        if password != confirm:
+            print("[-] Senhas não coincidem!")
+            return
+    
+    if op in ["1", "2", "3", "4", "5"]:
+        stego = PNGSteganography(password)
+        
+        if op == "1":
+            image = input("Imagem original (PNG): ").strip()
+            output = input("Imagem de saída (PNG): ").strip()
+            text = input("Texto a esconder: ").strip()
+            if stego.hide_data(image, output, text.encode('utf-8')):
+                print("[+] Sucesso! Texto escondido.")
+        
+        elif op == "2":
+            image = input("Imagem com dados: ").strip()
+            data = stego.extract_data(image)
+            if data:
+                print(f"\n[+] Texto extraído:\n{data.decode('utf-8')}\n")
+        
+        elif op == "3":
+            image = input("Imagem original (PNG): ").strip()
+            output = input("Imagem de saída (PNG): ").strip()
+            file_path = input("Arquivo a esconder: ").strip()
+            if stego.hide_file(image, output, file_path):
+                print("[+] Sucesso! Arquivo escondido.")
+        
+        elif op == "4":
+            image = input("Imagem com dados: ").strip()
+            output = input("Diretório/arquivo de saída: ").strip()
+            if stego.extract_to_file(image, output):
+                print("[+] Extração concluída.")
+        
+        elif op == "5":
+            img1 = input("Imagem original: ").strip()
+            img2 = input("Imagem modificada: ").strip()
+            stats, diff_img = ImageComparator.compare(img1, img2)
+            print(f"\n📊 Análise de diferenças:")
+            print(f"  Máxima diferença: {stats['max_diff']}")
+            print(f"  Diferença média: {stats['mean_diff']:.2f}")
+            print(f"  Pixels alterados: {stats['pixels_changed']} / {stats['total_pixels']}")
+            print(f"  Porcentagem alterada: {stats['percentage_changed']:.4f}%")
+            
+            save_diff = input("Salvar imagem de diferença? (s/N): ").strip().lower()
+            if save_diff == 's':
+                diff_path = input("Caminho para salvar: ").strip()
+                diff_img.save(diff_path)
+                print(f"[+] Imagem de diferença salva em {diff_path}")
+    
+    elif op in ["6", "7", "8", "9"]:
+        stego = WAVSteganography(password)
+        
+        if op == "6":
+            wav_file = input("Arquivo WAV original: ").strip()
+            output = input("Arquivo WAV de saída: ").strip()
+            text = input("Texto a esconder: ").strip()
+            if stego.hide_data(wav_file, output, text.encode('utf-8')):
+                print("[+] Sucesso! Texto escondido no áudio.")
+        
+        elif op == "7":
+            wav_file = input("Arquivo WAV com dados: ").strip()
+            data = stego.extract_data(wav_file)
+            if data:
+                print(f"\n[+] Texto extraído:\n{data.decode('utf-8')}\n")
+        
+        elif op == "8":
+            wav_file = input("Arquivo WAV original: ").strip()
+            output = input("Arquivo WAV de saída: ").strip()
+            file_path = input("Arquivo a esconder: ").strip()
+            if stego.hide_file(wav_file, output, file_path):
+                print("[+] Sucesso! Arquivo escondido no áudio.")
+        
+        elif op == "9":
+            wav_file = input("Arquivo WAV com dados: ").strip()
+            output = input("Diretório/arquivo de saída: ").strip()
+            if stego.extract_to_file(wav_file, output):
+                print("[+] Extração concluída.")
+    
+    else:
+        print("[-] Opção inválida!")
+
+
+if __name__ == "__main__":
+   try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] Encerrado pelo usuário")
+    except Exception as e:
+        print(f"\n[-] Erro: {e}")
+        import traceback
+        traceback.print_exc()
+```
