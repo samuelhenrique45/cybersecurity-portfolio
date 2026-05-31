@@ -528,4 +528,206 @@ class SimulationMode:
         # Simular port scan
         print("[SIM] Simulando PORT SCAN de 203.0.113.1...")
         for port in range(1, 30):
-            self.ids.tracker.add_port_hit("203.0.113.1", port, ti
+            self.ids.tracker.add_port_hit("203.0.113.1", port, timestamp + port)
+        
+        # Simular SYN flood
+        print("[SIM] Simulando SYN FLOOD de 203.0.113.2...")
+        for i in range(150):
+            self.ids.tracker.add_syn_packet("203.0.113.2", timestamp + i * 0.01)
+        
+        # Simular brute force
+        print("[SIM] Simulando BRUTE FORCE de 203.0.113.3...")
+        for i in range(15):
+            self.ids.tracker.add_auth_failure("203.0.113.3", timestamp + i * 2)
+        
+        # Forçar detecção
+        self.ids.detect_syn_flood(None, "203.0.113.2", timestamp + 1)
+        self.ids.detect_port_scan(None, "203.0.113.1", timestamp + 20)
+        self.ids.detect_brute_force(None, "203.0.113.3", "target", timestamp + 30)
+        
+        print("[SIM] Simulação concluída!")
+    
+    def load_pcap_file(self, pcap_path: str):
+        """Carrega arquivo PCAP para análise (requer Scapy)"""
+        if not SCAPY_AVAILABLE:
+            print("[ERROR] Scapy necessário para ler PCAP")
+            return
+        
+        from scapy.all import rdpcap
+        
+        print(f"[SIM] Carregando PCAP: {pcap_path}")
+        packets = rdpcap(pcap_path)
+        print(f"[SIM] Processando {len(packets)} pacotes...")
+        
+        for packet in packets:
+            if packet.haslayer(IP):
+                self.ids.analyze_packet(
+                    packet,
+                    packet[IP].src,
+                    packet[IP].dst,
+                    time.time()
+                )
+        
+        print("[SIM] Análise concluída!")
+
+
+# ============================================================================
+# INTERFACE PRINCIPAL
+# ============================================================================
+
+def print_banner():
+    banner = r"""
+    ╔═══════════════════════════════════════════════════════════════════════╗
+    ║                                                                       ║
+    ║    ███████╗██╗██████╗ ███████╗██╗    ██╗ █████╗ ██╗     ██╗           ║
+    ║    ██╔════╝██║██╔══██╗██╔════╝██║    ██║██╔══██╗██║     ██║           ║
+    ║    █████╗  ██║██████╔╝█████╗  ██║ █╗ ██║███████║██║     ██║           ║
+    ║    ██╔══╝  ██║██╔══██╗██╔══╝  ██║███╗██║██╔══██║██║     ██║           ║
+    ║    ██║     ██║██║  ██║███████╗╚███╔███╔╝██║  ██║███████╗███████╗      ║
+    ║    ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝╚══════╝      ║
+    ║                                                                       ║
+    ║              FIREWALL + IDS - DETECÇÃO DE INTRUSÃO                   ║
+    ║              SYN Flood | Port Scan | Brute Force | SQLi/XSS          ║
+    ╚═══════════════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
+
+def interactive_shell(firewall: FirewallEngine, ids: IDSEngine):
+    """Shell interativo para gerenciar firewall e IDS"""
+    while True:
+        print("\n" + "-" * 50)
+        print("   FIREWALL+IDS - COMANDOS")
+        print("-" * 50)
+        print("[1] Ver regras atuais")
+        print("[2] Bloquear IP")
+        print("[3] Desbloquear IP")
+        print("[4] Adicionar IP à whitelist")
+        print("[5] Ver alertas recentes")
+        print("[6] Ver estatísticas")
+        print("[7] Testar regras")
+        print("[8] Sair")
+        print("-" * 50)
+        
+        op = input("> ").strip()
+        
+        if op == "1":
+            print("\n📋 REGRAS ATUAIS:")
+            print(f"  IPs bloqueados: {firewall.rules['blocked_ips']}")
+            print(f"  IPs permitidos: {firewall.rules['allowed_ips']}")
+            print(f"  Portas bloqueadas: {firewall.rules['blocked_ports']}")
+            print(f"  Portas permitidas: {firewall.rules['allowed_ports']}")
+            print(f"  Rate limit: {firewall.rules['rate_limit']}/s")
+        
+        elif op == "2":
+            ip = input("IP para bloquear: ").strip()
+            if ip:
+                firewall.block_ip(ip, "Manual block", 3600)
+        
+        elif op == "3":
+            ip = input("IP para desbloquear: ").strip()
+            if ip:
+                firewall.unblock_ip(ip)
+        
+        elif op == "4":
+            ip = input("IP para whitelist: ").strip()
+            if ip:
+                firewall.allow_ip(ip)
+        
+        elif op == "5":
+            print("\n📋 ÚLTIMOS ALERTAS:")
+            for alert in ids.alerts[-10:]:
+                print(f"  [{alert['timestamp'][:19]}] {alert['severity']} - {alert['type']} - {alert['src_ip']}")
+        
+        elif op == "6":
+            print("\n📊 ESTATÍSTICAS:")
+            print(f"  Total alertas: {len(ids.alerts)}")
+            print(f"  IPs bloqueados: {len(firewall.rules['blocked_ips']) + len(firewall.blocked_until)}")
+            print(f"  IPs whitelist: {len(firewall.rules['allowed_ips'])}")
+        
+        elif op == "7":
+            ip = input("IP para testar: ").strip()
+            port = int(input("Porta: ").strip())
+            allowed, reason = firewall.check_packet(ip, port, "TCP")
+            print(f"  Resultado: {'✅ PERMITIDO' if allowed else '❌ BLOQUEADO'}")
+            print(f"  Razão: {reason}")
+        
+        elif op == "8":
+            break
+        
+        else:
+            print("Opção inválida")
+
+
+def main():
+    print_banner()
+    
+    # Inicializar componentes
+    firewall = FirewallEngine()
+    ids = IDSEngine(firewall)
+    sniffer = PacketSniffer(firewall, ids)
+    simulator = SimulationMode(firewall, ids)
+    
+    print("\n🔧 Configuração:")
+    print(f"  Interface: {Config.INTERFACE}")
+    print(f"  SYN Flood threshold: {Config.SYN_FLOOD_THRESHOLD}/s")
+    print(f"  Port Scan threshold: {Config.PORT_SCAN_THRESHOLD} ports/{Config.PORT_SCAN_WINDOW}s")
+    print(f"  Brute Force threshold: {Config.BRUTE_FORCE_THRESHOLD} attempts/{Config.BRUTE_FORCE_WINDOW}s")
+    print(f"  Block duration: {Config.BLOCK_DURATION}s")
+    
+    while True:
+        print("\n" + "-" * 50)
+        print("   MODO DE OPERAÇÃO")
+        print("-" * 50)
+        print("[1] Modo LIVE - Capturar pacotes (requer Scapy)")
+        print("[2] Modo SIMULAÇÃO - Testar com tráfego sintético")
+        print("[3] Modo PCAP - Analisar arquivo PCAP")
+        print("[4] Modo INTERATIVO - Gerenciar regras")
+        print("[5] Sair")
+        print("-" * 50)
+        
+        op = input("> ").strip()
+        
+        if op == "1":
+            if not SCAPY_AVAILABLE:
+                print("[ERRO] Scapy não instalado. Use modo simulação.")
+                continue
+            try:
+                sniffer.start_sniffing()
+            except KeyboardInterrupt:
+                sniffer.stop()
+        
+        elif op == "2":
+            simulator.generate_test_traffic()
+        
+        elif op == "3":
+            if not SCAPY_AVAILABLE:
+                print("[ERRO] Scapy necessário para ler PCAP")
+                continue
+            pcap_path = input("Caminho do arquivo PCAP: ").strip()
+            if os.path.exists(pcap_path):
+                simulator.load_pcap_file(pcap_path)
+            else:
+                print("Arquivo não encontrado")
+        
+        elif op == "4":
+            interactive_shell(firewall, ids)
+        
+        elif op == "5":
+            print("\n🔒 Encerrando firewall+IDS...")
+            break
+        
+        else:
+            print("Opção inválida")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n🔒 Encerrado pelo usuário")
+    except Exception as e:
+        print(f"\n[ERRO] {e}")
+        import traceback
+        traceback.print_exc()
+```
