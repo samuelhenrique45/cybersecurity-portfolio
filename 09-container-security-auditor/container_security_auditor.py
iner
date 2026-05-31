@@ -1,0 +1,1414 @@
+#!/usr/bin/env python3
+# ============================================================================
+# CONTAINER SECURITY AUDITOR - FERRAMENTA DE AUDITORIA DE SEGURANÇA PARA DOCKER
+# Análise de: vulnerabilidades em imagens, configuração de container, 
+# secrets expostos, recursos excessivos, CIS Benchmarks
+# ============================================================================
+
+import os
+import sys
+import json
+import subprocess
+import re
+import hashlib
+import tempfile
+import tarfile
+import io
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Set
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+
+# ============================================================================
+# CONSTANTES E CONFIGURAÇÃO
+# ============================================================================
+
+class Severity(Enum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
+
+    def color(self):
+        colors = {
+            "CRITICAL": "\033[91m",  # Red
+            "HIGH": "\033[95m",      # Purple
+            "MEDIUM": "\033[93m",    # Yellow
+            "LOW": "\033[94m",       # Blue
+            "INFO": "\033[92m"       # Green
+        }
+        return colors.get(self.value, "\033[0m")
+
+
+@dataclass
+class Finding:
+    """Estrutura para armazenar achados de segurança"""
+    title: str
+    description: str
+    severity: Severity
+    remediation: str
+    cve_id: str = None
+    reference: str = None
+    
+    def to_dict(self) -> dict:
+        return {
+            "title": self.title,
+            "description": self.description,
+            "severity": self.severity.value,
+            "remediation": self.remediation,
+            "cve_id": self.cve_id,
+            "reference": self.reference
+        }
+
+
+@dataclass
+class ContainerAuditResult:
+    """Resultado da auditoria de um container"""
+    container_id: str
+    container_name: str
+    image: str
+    status: str
+    findings: List[Finding] = field(default_factory=list)
+    score: int = 100
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+# ============================================================================
+# VERIFICAÇÕES DE SEGURANÇA - CIS BENCHMARKS PARA DOCKER
+# ============================================================================
+
+class ContainerSecurityAuditor:
+    """Auditor de segurança para containers Docker"""
+    
+    def __init__(self):
+        self.results: List[ContainerAuditResult] = []
+        self.global_findings: List[Finding] = []
+        self.docker_available = self._check_docker()
+    
+    def _check_docker(self) -> bool:
+        """Verifica se Docker está disponível"""
+        try:
+            result = subprocess.run(
+                ["docker", "version", "--format", "{{.Server.Version}}"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f"[+] Docker disponível: v{result.stdout.strip()}")
+                return True
+        except FileNotFoundError:
+            print("[-] Docker não encontrado no sistema")
+        return False
+    
+    def _run_docker_command(self, cmd: List[str]) -> Tuple[str, str, int]:
+        """Executa comando docker e retorna (stdout, stderr, returncode)"""
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return "", "Timeout", -1
+        except Exception as e:
+            return "", str(e), -1
+    
+    def _get_running_containers(self) -> List[Dict]:
+        """Obtém lista de containers em execução"""
+        stdout, _, _ = self._run_docker_command(
+            ["docker", "ps", "--format", "json"]
+        )
+        
+        containers = []
+        for line in stdout.strip().split('\n'):
+            if line:
+                try:
+                    containers.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        
+        # Fallback para formato antigo
+        if not containers:
+            stdout, _, _ = self._run_docker_command(
+                ["docker", "ps", "--format", "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"]
+            )
+            lines = stdout.strip().split('\n')[1:]  # Skip header
+            for line in lines:
+                parts = line.split('\t')
+                if len(parts) >= 4:
+                    containers.append({
+                        "ID": parts[0],
+                        "Names": parts[1],
+                        "Image": parts[2],
+                        "Status": parts[3]
+                    })
+        
+        return containers
+    
+    def _get_all_containers(self) -> List[Dict]:
+        """Obtém lista de todos os containers (incluindo parados)"""
+        stdout, _, _ = self._run_docker_command(
+            ["docker", "ps", "-a", "--format", "json"]
+        )
+        
+        containers = []
+        for line in stdout.strip().split('\n'):
+            if line:
+                try:
+                    containers.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return containers
+    
+    def _get_container_details(self, container_id: str) -> Dict:
+        """Obtém detalhes de um container específico"""
+        stdout, _, _ = self._run_docker_command(
+            ["docker", "inspect", container_id]
+        )
+        try:
+            data = json.loads(stdout)
+            if data:
+                return data[0]
+        except json.JSONDecodeError:
+            pass
+        return {}
+    
+    def _get_image_vulnerabilities(self, image_name: str) -> List[Finding]:
+        """Verifica vulnerabilidades conhecidas na imagem usando grype/trivy"""
+        findings = []
+        
+        # Tentar usar Trivy primeiro
+        trivy_found = self._scan_with_trivy(image_name)
+        if trivy_found:
+            return trivy_found
+        
+        # Tentar usar Grype como fallback
+        grype_found = self._scan_with_grype(image_name)
+        if grype_found:
+            return grype_found
+        
+        # Se nenhum scanner disponível, usar verificação básica
+        findings.append(Finding(
+            title="Scanner de Vulnerabilidades Não Disponível",
+            description="Trivy ou Grype não encontrados. Instale para análise completa de CVEs.",
+            severity=Severity.INFO,
+            remediation="Instale trivy (https://aquasecurity.github.io/trivy) ou grype (https://github.com/anchore/grype)"
+        ))
+        
+        return findings
+    
+    def _scan_with_trivy(self, image_name: str) -> List[Finding]:
+        """Escaneia imagem com Trivy"""
+        findings = []
+        
+        # Verificar se trivy está instalado
+        try:
+            subprocess.run(["trivy", "--version"], capture_output=True, check=False)
+        except FileNotFoundError:
+            return []
+        
+        print(f"    Escaneando {image_name} com Trivy...")
+        
+        # Pull da imagem se necessário
+        self._run_docker_command(["docker", "pull", image_name])
+        
+        # Executar trivy
+        stdout, stderr, rc = self._run_docker_command(
+            ["trivy", "image", "--format", "json", "--severity", "CRITICAL,HIGH", image_name]
+        )
+        
+        if rc != 0:
+            return []
+        
+        try:
+            data = json.loads(stdout)
+            for result in data.get("Results", []):
+                for vuln in result.get("Vulnerabilities", []):
+                    severity_str = vuln.get("Severity", "MEDIUM")
+                    severity = self._map_severity(severity_str)
+                    
+                    findings.append(Finding(
+                        title=f"CVE: {vuln.get('VulnerabilityID', 'Unknown')}",
+                        description=f"{vuln.get('Title', vuln.get('Description', ''))}\n"
+                                   f"Pacote: {vuln.get('PkgName', 'Unknown')} v{vuln.get('InstalledVersion', '')}",
+                        severity=severity,
+                        remediation=f"Atualizar para: {vuln.get('FixedVersion', 'versão mais recente')}",
+                        cve_id=vuln.get('VulnerabilityID'),
+                        reference=vuln.get('PrimaryURL')
+                    ))
+        except json.JSONDecodeError:
+            pass
+        
+        return findings
+    
+    def _scan_with_grype(self, image_name: str) -> List[Finding]:
+        """Escaneia imagem com Grype"""
+        findings = []
+        
+        try:
+            subprocess.run(["grype", "--version"], capture_output=True, check=False)
+        except FileNotFoundError:
+            return []
+        
+        print(f"    Escaneando {image_name} com Grype...")
+        
+        stdout, _, rc = self._run_docker_command(
+            ["grype", image_name, "-o", "json"]
+        )
+        
+        if rc != 0:
+            return []
+        
+        try:
+            data = json.loads(stdout)
+            for match in data.get("matches", []):
+                vuln = match.get("vulnerability", {})
+                artifact = match.get("artifact", {})
+                
+                severity_str = vuln.get("severity", "MEDIUM")
+                severity = self._map_severity(severity_str)
+                
+                findings.append(Finding(
+                    title=f"CVE: {vuln.get('id', 'Unknown')}",
+                    description=f"{vuln.get('description', '')[:200]}\n"
+                               f"Pacote: {artifact.get('name', 'Unknown')} v{artifact.get('version', '')}",
+                    severity=severity,
+                    remediation=vuln.get('fix', {}).get('versions', ['atualizar'])[0],
+                    cve_id=vuln.get('id'),
+                    reference=vuln.get('urls', [''])[0] if vuln.get('urls') else None
+                ))
+        except json.JSONDecodeError:
+            pass
+        
+        return findings
+    
+    def _map_severity(self, severity_str: str) -> Severity:
+        """Mapeia string de severidade para enum"""
+        severity_map = {
+            "CRITICAL": Severity.CRITICAL,
+            "HIGH": Severity.HIGH,
+            "MEDIUM": Severity.MEDIUM,
+            "LOW": Severity.LOW,
+            "INFO": Severity.INFO
+        }
+        return severity_map.get(severity_str.upper(), Severity.MEDIUM)
+    
+    # ========================================================================
+    # VERIFICAÇÕES DE CONFIGURAÇÃO DO CONTAINER
+    # ========================================================================
+    
+    def check_privileged_mode(self, details: Dict) -> Optional[Finding]:
+        """Verifica se container está rodando em modo privilegiado"""
+        host_config = details.get("HostConfig", {})
+        if host_config.get("Privileged", False):
+            return Finding(
+                title="Container em Modo Privilegiado",
+                description="O container está rodando com --privileged, o que lhe dá acesso a todos os dispositivos do host.",
+                severity=Severity.CRITICAL,
+                remediation="Remova o flag --privileged e adicione apenas as capacidades necessárias com --cap-add"
+            )
+        return None
+    
+    def check_root_user(self, details: Dict) -> Optional[Finding]:
+        """Verifica se container roda como root"""
+        config = details.get("Config", {})
+        user = config.get("User", "")
+        
+        if not user or user == "" or user == "0" or user == "root":
+            return Finding(
+                title="Container Rodando como Root",
+                description="O container está executando como usuário root. Isso pode permitir escalonamento de privilégios.",
+                severity=Severity.HIGH,
+                remediation="Crie um usuário não-root no Dockerfile e use 'USER <user>' ou execute com '--user <UID>'"
+            )
+        return None
+    
+    def check_host_network(self, details: Dict) -> Optional[Finding]:
+        """Verifica se container usa rede do host"""
+        host_config = details.get("HostConfig", {})
+        network_mode = host_config.get("NetworkMode", "")
+        
+        if network_mode == "host":
+            return Finding(
+                title="Container Usando Rede do Host",
+                description="O container está usando --network host, compartilhando a pilha de rede do host.",
+                severity=Severity.MEDIUM,
+                remediation="Use redes bridge isoladas ou user-defined networks para isolar o container"
+            )
+        return None
+    
+    def check_host_pid(self, details: Dict) -> Optional[Finding]:
+        """Verifica se container compartilha PID namespace"""
+        host_config = details.get("HostConfig", {})
+        pid_mode = host_config.get("PidMode", "")
+        
+        if pid_mode == "host":
+            return Finding(
+                title="Container Compartilha PID Namespace do Host",
+                description="O container pode ver e interagir com processos do host via --pid=host.",
+                severity=Severity.HIGH,
+                remediation="Remova o flag --pid=host para isolar o namespace de processos"
+            )
+        return None
+    
+    def check_readonly_rootfs(self, details: Dict) -> Optional[Finding]:
+        """Verifica se root filesystem é read-only"""
+        host_config = details.get("HostConfig", {})
+        readonly = host_config.get("ReadonlyRootfs", False)
+        
+        if not readonly:
+            return Finding(
+                title="Root Filesystem Permissivo",
+                description="O sistema de arquivos raiz é gravável. Malware pode persistir alterações.",
+                severity=Severity.MEDIUM,
+                remediation="Execute o container com '--read-only' e use volumes para dados que precisam ser escritos"
+            )
+        return None
+    
+    def check_resource_limits(self, details: Dict) -> Optional[Finding]:
+        """Verifica se limites de recursos estão configurados"""
+        host_config = details.get("HostConfig", {})
+        memory_limit = host_config.get("Memory", 0)
+        cpu_shares = host_config.get("CpuShares", 0)
+        
+        issues = []
+        if memory_limit == 0:
+            issues.append("sem limite de memória")
+        if cpu_shares == 0:
+            issues.append("sem limite de CPU")
+        
+        if issues:
+            return Finding(
+                title="Limites de Recursos Não Configurados",
+                description=f"Container sem restrições: {', '.join(issues)}. Pode causar DoS no host.",
+                severity=Severity.MEDIUM,
+                remediation="Use '--memory' e '--cpus' para limitar recursos do container"
+            )
+        return None
+    
+    def check_docker_socket_mount(self, details: Dict) -> Optional[Finding]:
+        """Verifica se docker.sock está montado"""
+        mounts = details.get("Mounts", [])
+        for mount in mounts:
+            if "/var/run/docker.sock" in mount.get("Source", ""):
+                return Finding(
+                    title="Docker Socket Montado no Container",
+                    description="O socket do Docker está montado. O container pode controlar o daemon Docker do host.",
+                    severity=Severity.CRITICAL,
+                    remediation="Remova a montagem de /var/run/docker.sock a menos que absolutamente necessário"
+                )
+        return None
+    
+    def check_sensitive_mounts(self, details: Dict) -> List[Finding]:
+        """Verifica montagens sensíveis"""
+        findings = []
+        sensitive_paths = [
+            "/etc/shadow", "/etc/passwd", "/etc/ssh", "/root/.ssh",
+            "/var/lib/docker", "/proc", "/sys", "/etc/kubernetes"
+        ]
+        
+        mounts = details.get("Mounts", [])
+        for mount in mounts:
+            source = mount.get("Source", "")
+            for sensitive in sensitive_paths:
+                if sensitive in source:
+                    findings.append(Finding(
+                        title="Montagem de Diretório Sensível",
+                        description=f"O diretório sensível '{source}' está montado no container.",
+                        severity=Severity.HIGH,
+                        remediation="Evite montar diretórios do sistema ou use bind mounts com permissões restritas"
+                    ))
+                    break
+        
+        return findings
+    
+    def check_environment_secrets(self, details: Dict) -> List[Finding]:
+        """Verifica variáveis de ambiente com secrets"""
+        findings = []
+        secret_patterns = [
+            (r'(?i)passw(or)?d', "senha"),
+            (r'(?i)secret', "secret"),
+            (r'(?i)token', "token"),
+            (r'(?i)key', "chave"),
+            (r'(?i)api[_-]?key', "API key"),
+            (r'(?i)auth', "autenticação"),
+            (r'[A-Za-z0-9+/]{40,}', "possível token longo"),
+        ]
+        
+        config = details.get("Config", {})
+        env_vars = config.get("Env", [])
+        
+        for env in env_vars:
+            for pattern, description in secret_patterns:
+                if re.search(pattern, env):
+                    # Ofuscar o valor
+                    parts = env.split('=', 1)
+                    if len(parts) == 2:
+                        name, value = parts
+                        if len(value) > 10:
+                            value = value[:6] + "..." + value[-4:]
+                        display_env = f"{name}={value}"
+                    else:
+                        display_env = env
+                    
+                    findings.append(Finding(
+                        title="Secret Exposto em Variável de Ambiente",
+                        description=f"Possível {description} encontrado em env: {display_env}",
+                        severity=Severity.HIGH,
+                        remediation="Use Docker secrets (Swarm) ou volumes com secrets em vez de variáveis de ambiente"
+                    ))
+                    break
+        
+        return findings
+    
+    def check_healthcheck(self, details: Dict) -> Optional[Finding]:
+        """Verifica se container tem healthcheck configurado"""
+        config = details.get("Config", {})
+        healthcheck = config.get("Healthcheck", {})
+        
+        if not healthcheck or not healthcheck.get("Test"):
+            return Finding(
+                title="Healthcheck Não Configurado",
+                description="O container não possui healthcheck configurado.",
+                severity=Severity.LOW,
+                remediation="Adicione HEALTHCHECK no Dockerfile ou use '--health-cmd' no docker run"
+            )
+        return None
+    
+    def check_label_metadata(self, details: Dict) -> Optional[Finding]:
+        """Verifica se container tem labels de metadados"""
+        config = details.get("Config", {})
+        labels = config.get("Labels", {})
+        
+        required_labels = ["maintainer", "version", "description"]
+        missing = [label for label in required_labels if label not in labels]
+        
+        if missing:
+            return Finding(
+                title="Metadados Faltando",
+                description=f"Labels recomendadas ausentes: {', '.join(missing)}",
+                severity=Severity.INFO,
+                remediation=f"Adicione LABEL {' '.join(missing)} no Dockerfile"
+            )
+        return None
+    
+    def check_exposed_ports(self, details: Dict) -> List[Finding]:
+        """Verifica portas expostas"""
+        findings = []
+        config = details.get("Config", {})
+        exposed_ports = config.get("ExposedPorts", {})
+        host_config = details.get("HostConfig", {})
+        port_bindings = host_config.get("PortBindings", {})
+        
+        for port in exposed_ports:
+            # Verificar se porta está publicada no host
+            if port in port_bindings:
+                bindings = port_bindings[port]
+               def check_exposed_ports(self, details: Dict) -> List[Finding]:
+        """Verifica portas expostas"""
+        findings = []
+        config = details.get("Config", {})
+        exposed_ports = config.get("ExposedPorts", {})
+        host_config = details.get("HostConfig", {})
+        port_bindings = host_config.get("PortBindings", {})
+        
+        for port in exposed_ports:
+            # Verificar se porta está publicada no host
+            if port in port_bindings:
+                bindings = port_bindings[port]
+                if bindings and bindings[0].get("HostIp", "0.0.0.0") == "0.0.0.0":
+                    findings.append(Finding(
+                        title=f"Porta {port} Exposta Publicamente",
+                        description=f"A porta {port} está publicada em 0.0.0.0, acessível externamente.",
+                        severity=Severity.MEDIUM,
+                        remediation="Publique portas apenas em localhost (127.0.0.1) quando possível"
+                    ))
+        
+        return findings
+    
+    def check_capabilities(self, details: Dict) -> List[Finding]:
+        """Verifica capacidades Linux do container"""
+        findings = []
+        host_config = details.get("HostConfig", {})
+        
+        # Capacidades perigosas
+        dangerous_caps = [
+            "CAP_SYS_ADMIN", "CAP_SYS_RAWIO", "CAP_SYS_PTRACE",
+            "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_DAC_OVERRIDE",
+            "CAP_DAC_READ_SEARCH", "CAP_SYS_MODULE", "CAP_SYSLOG"
+        ]
+        
+        cap_add = host_config.get("CapAdd", [])
+        cap_drop = host_config.get("CapDrop", [])
+        
+        for cap in dangerous_caps:
+            if cap in cap_add:
+                findings.append(Finding(
+                    title=f"Capacidade Perigosa Adicionada: {cap}",
+                    description=f"O container tem a capacidade {cap} adicionada, o que pode permitir escalonamento.",
+                    severity=Severity.HIGH,
+                    remediation=f"Remova --cap-add={cap} e adicione apenas capacidades estritamente necessárias"
+                ))
+        
+        # Verificar se todas as capacidades foram dropadas
+        if "ALL" not in cap_drop:
+            findings.append(Finding(
+                title="Capacidades Não Limitadas",
+                description="O container mantém capacidades Linux padrão. Drop capacidades desnecessárias.",
+                severity=Severity.MEDIUM,
+                remediation="Execute com '--cap-drop=ALL' e adicione apenas as necessárias com '--cap-add'"
+            ))
+        
+        return findings
+    
+    def check_seccomp_profile(self, details: Dict) -> Optional[Finding]:
+        """Verifica perfil seccomp"""
+        host_config = details.get("HostConfig", {})
+        security_opt = host_config.get("SecurityOpt", [])
+        
+        has_seccomp = any("seccomp" in opt for opt in security_opt)
+        
+        if not has_seccomp:
+            return Finding(
+                title="Perfil Seccomp Não Configurado",
+                description="O container não tem perfil seccomp personalizado.",
+                severity=Severity.LOW,
+                remediation="Use '--security-opt seccomp=/path/to/profile.json' ou o perfil padrão do Docker"
+            )
+        return None
+    
+    def check_apparmor_profile(self, details: Dict) -> Optional[Finding]:
+        """Verifica perfil AppArmor"""
+        host_config = details.get("HostConfig", {})
+        security_opt = host_config.get("SecurityOpt", [])
+        
+        has_apparmor = any("apparmor" in opt for opt in security_opt)
+        
+        if not has_apparmor:
+            return Finding(
+                title="Perfil AppArmor Não Configurado",
+                description="O container não tem perfil AppArmor.",
+                severity=Severity.LOW,
+                remediation="Use '--security-opt apparmor=profile-name' para restringir ainda mais"
+            )
+        return None
+    
+    def check_no_new_privileges(self, details: Dict) -> Optional[Finding]:
+        """Verifica flag no-new-privileges"""
+        host_config = details.get("HostConfig", {})
+        security_opt = host_config.get("SecurityOpt", [])
+        
+        has_nnp = any("no-new-privileges" in opt for opt in security_opt)
+        
+        if not has_nnp:
+            return Finding(
+                title="No New Privileges Não Ativado",
+                description="Processos no container podem ganhar novos privilégios via setuid/binários.",
+                severity=Severity.MEDIUM,
+                remediation="Execute com '--security-opt=no-new-privileges' para prevenir escalonamento"
+            )
+        return None
+    
+    def check_container_liveness(self, container_id: str, status: str) -> Optional[Finding]:
+        """Verifica se container está saudável"""
+        if "unhealthy" in status.lower():
+            return Finding(
+                title="Container Não Saudável",
+                description=f"O container está em estado: {status}",
+                severity=Severity.MEDIUM,
+                remediation=f"Verifique logs do container: docker logs {container_id}"
+            )
+        return None
+    
+    def check_restart_policy(self, details: Dict) -> Optional[Finding]:
+        """Verifica política de restart"""
+        host_config = details.get("HostConfig", {})
+        restart_policy = host_config.get("RestartPolicy", {})
+        
+        name = restart_policy.get("Name", "")
+        
+        if name == "always":
+            return Finding(
+                title="Política de Restart Sempre",
+                description="Container restart policy 'always' pode esconder falhas.",
+                severity=Severity.LOW,
+                remediation="Use 'unless-stopped' ou 'on-failure' com limites"
+            )
+        return None
+    
+    def audit_container(self, container: Dict) -> ContainerAuditResult:
+        """Audita um único container"""
+        container_id = container.get("ID", "")
+        container_name = container.get("Names", "").lstrip('/')
+        image = container.get("Image", "")
+        status = container.get("Status", "")
+        
+        print(f"\n[+] Auditando container: {container_name} ({container_id[:12]})")
+        
+        result = ContainerAuditResult(
+            container_id=container_id,
+            container_name=container_name,
+            image=image,
+            status=status
+        )
+        
+        # Obter detalhes completos
+        details = self._get_container_details(container_id)
+        if not details:
+            result.findings.append(Finding(
+                title="Não foi possível obter detalhes",
+                description="Falha ao inspecionar o container",
+                severity=Severity.INFO,
+                remediation="Verifique permissões do Docker"
+            ))
+            return result
+        
+        # Executar verificações
+        checks = [
+            self.check_privileged_mode(details),
+            self.check_root_user(details),
+            self.check_host_network(details),
+            self.check_host_pid(details),
+            self.check_readonly_rootfs(details),
+            self.check_resource_limits(details),
+            self.check_docker_socket_mount(details),
+            self.check_healthcheck(details),
+            self.check_restart_policy(details),
+            self.check_no_new_privileges(details),
+        ]
+        
+        for check in checks:
+            if check:
+                result.findings.append(check)
+        
+        # Verificações que retornam listas
+        result.findings.extend(self.check_sensitive_mounts(details))
+        result.findings.extend(self.check_environment_secrets(details))
+        result.findings.extend(self.check_exposed_ports(details))
+        result.findings.extend(self.check_capabilities(details))
+        
+        # Verificações opcionais
+        seccomp = self.check_seccomp_profile(details)
+        if seccomp:
+            result.findings.append(seccomp)
+        
+        apparmor = self.check_apparmor_profile(details)
+        if apparmor:
+            result.findings.append(apparmor)
+        
+        liveness = self.check_container_liveness(container_id, status)
+        if liveness:
+            result.findings.append(liveness)
+        
+        # Calcular score (100 - penalidades)
+        severity_weights = {
+            Severity.CRITICAL: 30,
+            Severity.HIGH: 20,
+            Severity.MEDIUM: 10,
+            Severity.LOW: 5,
+            Severity.INFO: 0
+        }
+        
+        penalty = sum(severity_weights[f.severity] for f in result.findings)
+        result.score = max(0, 100 - penalty)
+        
+        return result
+    
+    def audit_all_containers(self) -> List[ContainerAuditResult]:
+        """Audita todos os containers em execução"""
+        if not self.docker_available:
+            print("[-] Docker não disponível")
+            return []
+        
+        containers = self._get_running_containers()
+        
+        if not containers:
+            print("[-] Nenhum container em execução encontrado")
+            return []
+        
+        print(f"\n[+] Encontrados {len(containers)} containers em execução")
+        
+        results = []
+        for container in containers:
+            result = self.audit_container(container)
+            results.append(result)
+        
+        self.results = results
+        return results
+    
+    def audit_specific_container(self, container_id_or_name: str) -> Optional[ContainerAuditResult]:
+        """Audita um container específico pelo ID ou nome"""
+        if not self.docker_available:
+            print("[-] Docker não disponível")
+            return None
+        
+        # Buscar container
+        containers = self._get_all_containers()
+        target = None
+        
+        for c in containers:
+            if c.get("ID", "").startswith(container_id_or_name) or c.get("Names", "").lstrip('/') == container_id_or_name:
+                target = c
+                break
+        
+        if not target:
+            print(f"[-] Container não encontrado: {container_id_or_name}")
+            return None
+        
+        return self.audit_container(target)
+
+
+# ============================================================================
+# DOCKER DAEMON SECURITY CHECKS
+# ============================================================================
+
+class DockerDaemonAuditor:
+    """Audita a configuração do daemon Docker"""
+    
+    def __init__(self):
+        self.findings: List[Finding] = []
+    
+    def check_daemon_config(self) -> List[Finding]:
+        """Verifica configuração do daemon Docker"""
+        findings = []
+        
+        # Verificar se Docker socket está exposto
+        docker_socket = "/var/run/docker.sock"
+        if os.path.exists(docker_socket):
+            socket_perms = oct(os.stat(docker_socket).st_mode)[-3:]
+            if socket_perms != "660":
+                findings.append(Finding(
+                    title="Permissões Incorretas no Docker Socket",
+                    description=f"Socket Docker tem permissões {socket_perms}. Deveria ser 660.",
+                    severity=Severity.HIGH,
+                    remediation="sudo chmod 660 /var/run/docker.sock && sudo chown root:docker /var/run/docker.sock"
+                ))
+        
+        # Verificar configuração do daemon
+        daemon_config_paths = [
+            "/etc/docker/daemon.json",
+            "/etc/docker/daemon.yaml"
+        ]
+        
+        for config_path in daemon_config_paths:
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, 'r') as f:
+                        if config_path.endswith('.json'):
+                            config = json.load(f)
+                            
+                            # Verificar se live-restore está ativado
+                            if config.get("live-restore", False):
+                                findings.append(Finding(
+                                    title="Live Restore Ativado",
+                                    description="live-restore mantém containers rodando quando daemon para.",
+                                    severity=Severity.INFO,
+                                    remediation="Considere desativar em ambientes críticos"
+                                ))
+                            
+                            # Verificar se iptables está ativado
+                            if not config.get("iptables", True):
+                                findings.append(Finding(
+                                    title="iptables Desativado",
+                                    description="Docker não gerencia regras iptables automaticamente.",
+                                    severity=Severity.MEDIUM,
+                                    remediation="Ative iptables no daemon.json"
+                                ))
+                except:
+                    pass
+        
+        return findings
+    
+    def check_docker_version(self) -> Optional[Finding]:
+        """Verifica versão do Docker"""
+        try:
+            result = subprocess.run(
+                ["docker", "version", "--format", "{{.Server.Version}}"],
+                capture_output=True, text=True
+            )
+            version = result.stdout.strip()
+            
+            # Verificar se versão é antiga
+            if version:
+                major, minor = version.split('.')[:2]
+                if int(major) < 20 or (int(major) == 20 and int(minor) < 10):
+                    return Finding(
+                        title=f"Versão do Docker Desatualizada",
+                        description=f"Docker v{version} pode ter vulnerabilidades conhecidas.",
+                        severity=Severity.MEDIUM,
+                        remediation="Atualize para a versão mais recente do Docker Engine"
+                    )
+        except:
+            pass
+        
+        return None
+
+
+# ============================================================================
+# GERADOR DE RELATÓRIO (CONTINUAÇÃO)
+# ============================================================================
+
+class ReportGenerator:
+    """Gera relatórios em diferentes formatos"""
+    
+    @staticmethod
+    def _get_score_color(score: float) -> str:
+        """Retorna cor baseada no score"""
+        if score >= 80:
+            return "#28a745"
+        elif score >= 60:
+            return "#ffc107"
+        elif score >= 40:
+            return "#fd7e14"
+        else:
+            return "#dc3545"
+    
+    @staticmethod
+    def generate_html(results: List[ContainerAuditResult], global_findings: List[Finding], 
+                      daemon_findings: List[Finding] = None,
+                      output_file: str = "container_audit_report.html") -> str:
+        """Gera relatório HTML completo"""
+        
+        total_containers = len(results)
+        total_findings = sum(len(r.findings) for r in results) + len(global_findings) + (len(daemon_findings) if daemon_findings else 0)
+        
+        severity_counts = defaultdict(int)
+        for result in results:
+            for finding in result.findings:
+                severity_counts[finding.severity.value] += 1
+        for finding in global_findings:
+            severity_counts[finding.severity.value] += 1
+        if daemon_findings:
+            for finding in daemon_findings:
+                severity_counts[finding.severity.value] += 1
+        
+        # Calcular score médio
+        avg_score = sum(r.score for r in results) / total_containers if total_containers > 0 else 100
+        
+        html = f'''<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Container Security Audit Report</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            padding: 20px;
+            color: #eee;
+        }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        
+        .header {{
+            background: linear-gradient(135deg, #0f3460 0%, #1a1a2e 100%);
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            text-align: center;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }}
+        .header h1 {{ font-size: 2.5em; margin-bottom: 10px; color: #00d4ff; }}
+        .header p {{ opacity: 0.8; }}
+        
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .stat-card {{
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+        }}
+        .stat-card .number {{ font-size: 2.5em; font-weight: bold; color: #00d4ff; }}
+        .stat-card .label {{ margin-top: 10px; opacity: 0.8; }}
+        
+        .score-card {{
+            background: {ReportGenerator._get_score_color(avg_score)};
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            margin-bottom: 30px;
+        }}
+        .score-card .score {{ font-size: 3em; font-weight: bold; }}
+        .score-card .label {{ margin-top: 5px; }}
+        
+        .severity-badge {{
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }}
+        .severity-CRITICAL {{ background: #dc3545; }}
+        .severity-HIGH {{ background: #fd7e14; }}
+        .severity-MEDIUM {{ background: #ffc107; color: #333; }}
+        .severity-LOW {{ background: #28a745; }}
+        .severity-INFO {{ background: #17a2b8; }}
+        
+        .section-title {{
+            font-size: 1.5em;
+            margin: 30px 0 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #00d4ff;
+        }}
+        
+        .container-card {{
+            background: rgba(255,255,255,0.05);
+            border-radius: 15px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }}
+        .container-header {{
+            background: rgba(0,212,255,0.1);
+            padding: 15px 20px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }}
+        .container-info {{
+            flex: 1;
+        }}
+        .container-name {{ font-weight: bold; font-size: 1.1em; }}
+        .container-image {{ font-family: monospace; font-size: 0.85em; opacity: 0.7; margin-top: 5px; }}
+        .container-score {{
+            background: {ReportGenerator._get_score_color(avg_score)};
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 1.2em;
+        }}
+        .container-status {{
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85em;
+        }}
+        .status-running {{ background: #28a745; }}
+        .status-exited {{ background: #6c757d; }}
+        .status-unhealthy {{ background: #dc3545; }}
+        
+        .container-body {{ padding: 20px; display: none; }}
+        .container-body.show {{ display: block; }}
+        
+        .finding {{
+            background: rgba(0,0,0,0.3);
+            border-left: 4px solid;
+            margin-bottom: 15px;
+            padding: 15px;
+            border-radius: 5px;
+        }}
+        .finding-critical {{ border-left-color: #dc3545; }}
+        .finding-high {{ border-left-color: #fd7e14; }}
+        .finding-medium {{ border-left-color: #ffc107; }}
+        .finding-low {{ border-left-color: #28a745; }}
+        .finding-info {{ border-left-color: #17a2b8; }        .finding-title {{ font-weight: bold; margin-bottom: 8px; }}
+        .finding-description {{ margin-bottom: 8px; opacity: 0.9; }}
+        .finding-remediation {{
+            background: rgba(40,167,69,0.2);
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+            font-size: 0.9em;
+        }}
+        .cve-badge {{
+            display: inline-block;
+            background: #dc3545;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.75em;
+            margin-left: 10px;
+        }}
+        
+        button {{
+            background: #00d4ff;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            color: #1a1a2e;
+            font-weight: bold;
+            transition: transform 0.2s;
+        }}
+        button:hover {{ transform: scale(1.05); }}
+        
+        .expand-all, .collapse-all {{
+            margin: 10px 5px;
+            background: rgba(255,255,255,0.2);
+            color: #fff;
+        }}
+        
+        .footer {{
+            text-align: center;
+            margin-top: 50px;
+            padding: 20px;
+            opacity: 0.6;
+            font-size: 0.85em;
+        }}
+        
+        @media (max-width: 768px) {{
+            .container-header {{
+                flex-direction: column;
+                text-align: center;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🐳 Container Security Auditor</h1>
+            <p>Relatório Completo de Auditoria de Segurança</p>
+            <p style="font-size: 0.85em;">{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card"><div class="number">{total_containers}</div><div class="label">Containers Auditados</div></div>
+            <div class="stat-card"><div class="number">{total_findings}</div><div class="label">Total de Achados</div></div>
+            <div class="stat-card"><div class="number">{severity_counts.get('CRITICAL', 0)}</div><div class="label">Críticos</div></div>
+            <div class="stat-card"><div class="number">{severity_counts.get('HIGH', 0)}</div><div class="label">Altos</div></div>
+            <div class="stat-card"><div class="number">{severity_counts.get('MEDIUM', 0)}</div><div class="label">Médios</div></div>
+            <div class="stat-card"><div class="number">{severity_counts.get('LOW', 0)}</div><div class="label">Baixos</div></div>
+        </div>
+        
+        <div class="score-card">
+            <div class="score">{avg_score:.1f}</div>
+            <div class="label">Score Médio de Segurança</div>
+        </div>
+'''
+        
+        # Seção de achados globais
+        if global_findings:
+            html += '''
+        <div class="section-title">📋 Achados Globais</div>
+'''
+            for finding in global_findings:
+                severity_class = finding.severity.value.lower()
+                html += f'''
+            <div class="finding finding-{severity_class}">
+                <div class="finding-title">
+                    <span class="severity-badge severity-{finding.severity.value}">{finding.severity.value}</span>
+                    {finding.title}
+                </div>
+                <div class="finding-description">{finding.description}</div>
+                <div class="finding-remediation">🔧 Remedição: {finding.remediation}</div>
+            </div>
+'''
+        
+        # Seção do Docker Daemon
+        if daemon_findings:
+            html += '''
+        <div class="section-title">⚙️ Configuração do Docker Daemon</div>
+'''
+            for finding in daemon_findings:
+                severity_class = finding.severity.value.lower()
+                html += f'''
+            <div class="finding finding-{severity_class}">
+                <div class="finding-title">
+                    <span class="severity-badge severity-{finding.severity.value}">{finding.severity.value}</span>
+                    {finding.title}
+                </div>
+                <div class="finding-description">{finding.description}</div>
+                <div class="finding-remediation">🔧 Remedição: {finding.remediation}</div>
+            </div>
+'''
+        
+        # Seção de containers
+        html += '''
+        <div class="section-title">📦 Containers Auditados</div>
+        <div style="margin-bottom: 15px;">
+            <button class="expand-all" onclick="expandAll()">Expandir Todos</button>
+            <button class="collapse-all" onclick="collapseAll()">Recolher Todos</button>
+        </div>
+'''
+        
+        for i, result in enumerate(results):
+            status_class = "status-running" if "Up" in result.status else "status-exited" if "Exited" in result.status else "status-unhealthy"
+            
+            html += f'''
+        <div class="container-card">
+            <div class="container-header" onclick="toggleContainer({i})">
+                <div class="container-info">
+                    <div class="container-name">{result.container_name}</div>
+                    <div class="container-image">📦 {result.image}</div>
+                </div>
+                <div>
+                    <span class="container-status {status_class}">{result.status.split()[0] if result.status else "Unknown"}</span>
+                    <span class="container-score">{result.score}</span>
+                </div>
+            </div>
+            <div class="container-body" id="container-{i}">
+                <p><strong>🆔 Container ID:</strong> {result.container_id}</p>
+                <p><strong>📅 Scan realizado:</strong> {result.timestamp}</p>
+                <p><strong>🔍 Achados:</strong> {len(result.findings)}</p>
+'''
+            
+            if result.findings:
+                html += '''
+                <div style="margin-top: 15px;">
+'''
+                for finding in result.findings:
+                    finding_class = finding.severity.value.lower()
+                    html += f'''
+                    <div class="finding finding-{finding_class}">
+                        <div class="finding-title">
+                            <span class="severity-badge severity-{finding.severity.value}">{finding.severity.value}</span>
+                            {finding.title}
+                            {f'<span class="cve-badge">{finding.cve_id}</span>' if finding.cve_id else ''}
+                        </div>
+                        <div class="finding-description">{finding.description}</div>
+                        <div class="finding-remediation">🔧 Remedição: {finding.remediation}</div>
+                    </div>
+'''
+                html += '''
+                </div>
+'''
+            else:
+                html += '''
+                <div style="margin-top: 15px; text-align: center; padding: 20px; background: rgba(40,167,69,0.2); border-radius: 10px;">
+                    ✅ Nenhum achado de segurança para este container!
+                </div>
+'''
+            
+            html += '''
+            </div>
+        </div>
+'''
+        
+        html += f'''
+        <div class="footer">
+            <p>Container Security Auditor - Relatório gerado automaticamente</p>
+            <p>⚠️ Use apenas em sistemas autorizados</p>
+        </div>
+    </div>
+    
+    <script>
+        function toggleContainer(id) {{
+            const element = document.getElementById('container-' + id);
+            element.classList.toggle('show');
+        }}
+        
+        function expandAll() {{
+            const bodies = document.querySelectorAll('.container-body');
+            bodies.forEach(body => body.classList.add('show'));
+        }}
+        
+        function collapseAll() {{
+            const bodies = document.querySelectorAll('.container-body');
+            bodies.forEach(body => body.classList.remove('show'));
+        }}
+    </script>
+</body>
+</html>
+'''
+        
+        # Salvar arquivo
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(html)
+        
+        print(f"\n[+] Relatório HTML gerado: {output_file}")
+        return output_file
+    
+    @staticmethod
+    def generate_json(results: List[ContainerAuditResult], global_findings: List[Finding],
+                      daemon_findings: List[Finding] = None,
+                      output_file: str = "container_audit_report.json") -> str:
+        """Gera relatório em JSON"""
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "total_containers": len(results),
+            "total_findings": sum(len(r.findings) for r in results) + len(global_findings) + (len(daemon_findings) if daemon_findings else 0),
+            "global_findings": [f.to_dict() for f in global_findings],
+            "daemon_findings": [f.to_dict() for f in (daemon_findings or [])],
+            "containers": [
+                {
+                    "id": r.container_id,
+                    "name": r.container_name,
+                    "image": r.image,
+                    "status": r.status,
+                    "score": r.score,
+                    "findings": [f.to_dict() for f in r.findings]
+                }
+                for r in results
+            ]
+        }
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        
+        print(f"[+] Relatório JSON gerado: {output_file}")
+        return output_file
+
+
+# ============================================================================
+# INTERFACE PRINCIPAL
+# ============================================================================
+
+def print_banner():
+    banner = r'''
+    ╔═══════════════════════════════════════════════════════════════════════╗
+    ║                                                                       ║
+    ║     ██████╗ ██████╗ ███╗   ██╗████████╗ █████╗ ██╗███╗   ██╗███████╗  ║
+    ║    ██╔════╝██╔═══██╗████╗  ██║╚══██╔══╝██╔══██╗██║████╗  ██║██╔════╝  ║
+    ║    ██║     ██║   ██║██╔██╗ ██║   ██║   ███████║██║██╔██╗ ██║███████╗  ║
+    ║    ██║     ██║   ██║██║╚██╗██║   ██║   ██╔══██║██║██║╚██╗██║╚════██║  ║
+    ║    ╚██████╗╚██████╔╝██║ ╚████║   ██║   ██║  ██║██║██║ ╚████║███████║  ║
+    ║     ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝  ║
+    ║                                                                       ║
+    ║              CONTAINER SECURITY AUDITOR - v1.0                        ║
+    ║         Auditoria de Segurança para Docker Containers                 ║
+    ╚═══════════════════════════════════════════════════════════════════════╝
+    '''
+    print(banner)
+
+
+def main():
+    print_banner()
+    
+    print("\n🔧 Verificando dependências...")
+    
+    auditor = ContainerSecurityAuditor()
+    
+    if not auditor.docker_available:
+        print("\n[-] Docker não está disponível. Instale o Docker primeiro.")
+        print("    https://docs.docker.com/get-docker/")
+        return
+    
+    print("\n" + "-" * 50)
+    print("   CONTAINER SECURITY AUDITOR")
+    print("-" * 50)
+    print("[1] Auditar todos os containers em execução")
+    print("[2] Auditar container específico")
+    print("[3] Auditar imagens Docker")
+    print("[4] Verificar configuração do Docker Daemon")
+    print("[5] Sair")
+    print("-" * 50)
+    
+    op = input("\nEscolha: ").strip()
+    
+    if op == "1":
+        print("\n🔍 Iniciando auditoria de todos os containers...")
+        results = auditor.audit_all_containers()
+        
+        if results:
+            # Verificar daemon
+            daemon_auditor = DockerDaemonAuditor()
+            daemon_findings = daemon_auditor.check_daemon_config()
+            version_finding = daemon_auditor.check_docker_version()
+            if version_finding:
+                daemon_findings.append(version_finding)
+            
+            # Gerar relatório
+            format_choice = input("\nFormato do relatório (html/json): ").strip().lower() or "html"
+            filename = input("Nome do arquivo (padrão: container_audit_report): ").strip()
+            if not filename:
+                filename = "container_audit_report"
+            
+            if format_choice == "json":
+                ReportGenerator.generate_json(results, [], daemon_findings, output_file=f"{filename}.json")
+            else:
+                ReportGenerator.generate_html(results, [], daemon_findings, output_file=f"{filename}.html")
+            
+            # Exibir resumo
+            print("\n📊 RESUMO DA AUDITORIA:")
+            print(f"  Containers auditados: {len(results)}")
+            print(f"  Score médio: {sum(r.score for r in results)/len(results):.1f}")
+            
+            critical = sum(1 for r in results for f in r.findings if f.severity == Severity.CRITICAL)
+            high = sum(1 for r in results for f in r.findings if f.severity == Severity.HIGH)
+            print(f"  Achados: {critical} críticos, {high} altos")
+            
+            if daemon_findings:
+                print(f"  Achados no daemon: {len(daemon_findings)}")
+    
+    elif op == "2":
+        container = input("ID ou nome do container: ").strip()
+        result = auditor.audit_specific_container(container)
+        
+        if result:
+            print(f"\n📊 RESULTADO PARA {result.container_name}:")
+            print(f"  Score: {result.score}")
+            print(f"  Achados: {len(result.findings)}")
+            
+            for finding in result.findings:
+                print(f"\n  [{finding.severity.value}] {finding.title}")
+                print(f"    → {finding.remediation}")
+            
+            # Opção de gerar relatório
+            gen_report = input("\nGerar relatório HTML? (s/N): ").strip().lower()
+            if gen_report == 's':
+                ReportGenerator.generate_html([result], [], output_file=f"audit_{result.container_name}.html")
+    
+    elif op == "3":
+        print("\n🔍 Auditoria de Imagens Docker")
+        image_auditor = ImageSecurityAuditor()
+        
+        # Listar imagens
+        stdout, _, _ = auditor._run_docker_command(["docker", "images", "--format", "table {{.Repository}}:{{.Tag}}\t{{.Size}}"])
+        print("\nImagens disponíveis:")
+        lines = stdout.strip().split('\n')[1:]  # Skip header
+        images = []
+        for i, line in enumerate(lines, 1):
+            if line and "<none>" not in line:
+                parts = line.split('\t')
+                if len(parts) >= 1 and parts[0] and parts[0] != "<none>":
+                    images.append(parts[0])
+                    print(f"  [{i}] {parts[0]} ({parts[1] if len(parts) > 1 else 'N/A'})")
+        
+        if images:
+            choice = input("\nNúmero da imagem ou nome: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(images):
+                image_name = images[int(choice) - 1]
+            else:
+                image_name = choice
+            
+            findings = image_auditor.audit_image(image_name)
+            
+            if findings:
+                print(f"\n📋 Achados para {image_name}:")
+                for finding in findings:
+                    print(f"\n  [{finding.severity.value}] {finding.title}")
+                    print(f"    {finding.description[:200]}")
+                    print(f"    → {finding.remediation}")
+            else:
+                print(f"\n✅ Nenhum achado significativo para {image_name}")
+    
+    elif op == "4":
+        print("\n🔍 Verificando configuração do Docker Daemon...")
+        daemon_auditor = DockerDaemonAuditor()
+        
+        findings = daemon_auditor.check_daemon_config()
+        version_finding = daemon_auditor.check_docker_version()
+        if version_finding:
+            findings.append(version_finding)
+        
+        if findings:
+            print("\n📋 Achados na configuração do Daemon:")
+            for finding in findings:
+                print(f"\n  [{finding.severity.value}] {finding.title}")
+                print(f"    {finding.description}")
+                print(f"    → {finding.remediation}")
+        else:
+            print("\n✅ Configuração do Docker Daemon parece segura!")
+    
+    elif op == "5":
+        print("\n🔒 Encerrando...")
+    
+    else:
+        print("\n[-] Opção inválida!")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] Encerrado pelo usuário")
+    except Exception as e:
+        print(f"\n[!] Erro: {e}")
+        import traceback
+        traceback.print_exc()
