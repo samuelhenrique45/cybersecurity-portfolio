@@ -551,4 +551,12 @@ def main():
 
 if __name__ == "__main__":
 try:
-        from Crypt
+        from Crypt.Cipher import AES
+        main()
+    except ImportError:
+        print("Erro: pycryptodome não instalado. Instale com: pip install pycryptodome")
+    except Exception as e:
+        print(f"Erro: {e}")
+        import traceback
+        traceback.print_exc()
+```
