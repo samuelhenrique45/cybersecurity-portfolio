@@ -1,0 +1,531 @@
+# ============================================================================
+# SIMPLE FIREWALL + IDS - SISTEMA DE DETECÇÃO E PREVENÇÃO DE INTRUSÃO
+# Captura de pacotes com Scapy | Detecção: SYN Flood, Port Scan, Brute Force
+# Bloqueio dinâmico de IPs | Alertas coloridos em tempo real
+# ============================================================================
+
+import os
+import sys
+import time
+import threading
+import json
+import socket
+import struct
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Set
+
+# Tentar importar Scapy com fallback
+try:
+    from scapy.all import sniff, IP, TCP, UDP, ICMP, Raw, sr1, conf
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    print("[!] Scapy não instalado. Instale com: pip install scapy")
+    print("[!] Usando modo de simulação (arquivo PCAP)")
+
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
+
+class Config:
+    # Regras de firewall
+    BLOCKED_IPS = set()
+    ALLOWED_IPS = {'127.0.0.1', '192.168.1.1'}
+    BLOCKED_PORTS = {23, 445, 135, 139}  # Telnet, SMB, etc.
+    ALLOWED_PORTS = {80, 443, 22, 53, 3306}
+    
+    # Thresholds IDS
+    SYN_FLOOD_THRESHOLD = 100      # SYN packets per second
+    PORT_SCAN_THRESHOLD = 15       # unique ports in 10 seconds
+    BRUTE_FORCE_THRESHOLD = 10     # failed attempts per 30 seconds
+    RATE_LIMIT = 50                # max packets per second per IP
+    
+    # Time windows (seconds)
+    PORT_SCAN_WINDOW = 10
+    BRUTE_FORCE_WINDOW = 30
+    BLOCK_DURATION = 300           # 5 minutes
+    
+    # Logging
+    LOG_FILE = "firewall_ids.log"
+    ALERT_LOG = "alerts.json"
+    RULES_FILE = "firewall_rules.json"
+    
+    # Network interface
+    INTERFACE = "eth0"  # Change to your interface
+    FILTER = "ip"
+
+
+# ============================================================================
+# ESTRUTURAS DE DADOS
+# ============================================================================
+
+class AttackTracker:
+    """Rastreia métricas por IP para detectar ataques"""
+    
+    def __init__(self):
+        self.syn_packets = defaultdict(lambda: deque(maxlen=1000))
+        self.port_hits = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
+        self.unique_ports = defaultdict(lambda: set())
+        self.auth_failures = defaultdict(lambda: deque(maxlen=100))
+        self.packet_count = defaultdict(lambda: deque(maxlen=1000))
+        self.last_block_time = defaultdict(float)
+    
+    def add_syn_packet(self, ip: str, timestamp: float):
+        self.syn_packets[ip].append(timestamp)
+        # Clean old entries
+        while self.syn_packets[ip] and timestamp - self.syn_packets[ip][0] > 1:
+            self.syn_packets[ip].popleft()
+    
+    def get_syn_rate(self, ip: str) -> int:
+        return len(self.syn_packets[ip])
+    
+    def add_port_hit(self, ip: str, port: int, timestamp: float):
+        if port not in self.port_hits[ip]:
+            self.port_hits[ip][port] = deque(maxlen=100)
+        self.port_hits[ip][port].append(timestamp)
+        self.unique_ports[ip].add(port)
+        
+        # Clean old unique ports
+        cutoff = timestamp - Config.PORT_SCAN_WINDOW
+        for p in list(self.unique_ports[ip]):
+            if p not in self.port_hits[ip] or all(t < cutoff for t in self.port_hits[ip][p]):
+                self.unique_ports[ip].discard(p)
+    
+    def get_unique_ports(self, ip: str, timestamp: float) -> int:
+        return len(self.unique_ports[ip])
+    
+    def add_auth_failure(self, ip: str, timestamp: float):
+        self.auth_failures[ip].append(timestamp)
+        while self.auth_failures[ip] and timestamp - self.auth_failures[ip][0] > Config.BRUTE_FORCE_WINDOW:
+            self.auth_failures[ip].popleft()
+    
+    def get_auth_failures(self, ip: str) -> int:
+        return len(self.auth_failures[ip])
+    
+    def add_packet(self, ip: str, timestamp: float):
+        self.packet_count[ip].append(timestamp)
+        while self.packet_count[ip] and timestamp - self.packet_count[ip][0] > 1:
+            self.packet_count[ip].popleft()
+    
+    def get_packet_rate(self, ip: str) -> int:
+        return len(self.packet_count[ip])
+
+
+# ============================================================================
+# FIREWALL ENGINE
+# ============================================================================
+
+class FirewallEngine:
+    """Firewall stateful com bloqueio de IPs"""
+    
+    def __init__(self):
+        self.rules = self.load_rules()
+        self.blocked_until = {}
+        self.connections = defaultdict(lambda: defaultdict(dict))
+        self.lock = threading.Lock()
+    
+    def load_rules(self) -> Dict:
+        if os.path.exists(Config.RULES_FILE):
+            with open(Config.RULES_FILE, 'r') as f:
+                return json.load(f)
+        return {
+            "blocked_ips": list(Config.BLOCKED_IPS),
+            "allowed_ips": list(Config.ALLOWED_IPS),
+            "blocked_ports": list(Config.BLOCKED_PORTS),
+            "allowed_ports": list(Config.ALLOWED_PORTS),
+            "rate_limit": Config.RATE_LIMIT
+        }
+    
+    def save_rules(self):
+        with open(Config.RULES_FILE, 'w') as f:
+            json.dump(self.rules, f, indent=2)
+    
+    def is_blocked(self, ip: str) -> Tuple[bool, str]:
+        """Verifica se IP está bloqueado"""
+        if ip in self.rules["allowed_ips"]:
+            return False, "whitelisted"
+        
+        if ip in self.rules["blocked_ips"]:
+            return True, "permanent_block"
+        
+        if ip in self.blocked_until:
+            if time.time() < self.blocked_until[ip]:
+                remaining = int(self.blocked_until[ip] - time.time())
+                return True, f"temporary_block ({remaining}s remaining)"
+            else:
+                del self.blocked_until[ip]
+        
+        return False, "allowed"
+    
+    def block_ip(self, ip: str, reason: str, duration: int = Config.BLOCK_DURATION):
+        """Bloqueia IP temporariamente ou permanentemente"""
+        with self.lock:
+            if ip in self.rules["allowed_ips"]:
+                return
+            
+            self.blocked_until[ip] = time.time() + duration
+            
+            # Se severidade alta, adicionar à blacklist permanente
+            if "flood" in reason.lower() or "critical" in reason.lower():
+                if ip not in self.rules["blocked_ips"]:
+                    self.rules["blocked_ips"].append(ip)
+                    self.save_rules()
+            
+            self.log_action("BLOCK", ip, reason, duration)
+    
+    def unblock_ip(self, ip: str):
+        """Desbloqueia IP"""
+        with self.lock:
+            if ip in self.blocked_until:
+                del self.blocked_until[ip]
+            if ip in self.rules["blocked_ips"]:
+                self.rules["blocked_ips"].remove(ip)
+                self.save_rules()
+            self.log_action("UNBLOCK", ip, "Manual unblock", 0)
+    
+    def allow_ip(self, ip: str):
+        """Adiciona IP à whitelist"""
+        with self.lock:
+            if ip not in self.rules["allowed_ips"]:
+                self.rules["allowed_ips"].append(ip)
+                if ip in self.rules["blocked_ips"]:
+                    self.rules["blocked_ips"].remove(ip)
+                self.save_rules()
+            self.log_action("ALLOW", ip, "Added to whitelist", 0)
+    
+    def check_packet(self, src_ip: str, dst_port: int, protocol: str) -> Tuple[bool, str]:
+        """Avalia se pacote deve ser permitido"""
+        blocked, reason = self.is_blocked(src_ip)
+        if blocked:
+            return False, reason
+        
+        # Regras de porta
+        if dst_port in self.rules["blocked_ports"]:
+            return False, f"blocked_port_{dst_port}"
+        
+        # Regras de protocolo
+        if protocol.upper() == "ICMP":
+            return True, "icmp_allowed"
+        
+        return True, "allowed"
+    
+    def log_action(self, action: str, ip: str, reason: str, duration: int = 0):
+        """Registra ação do firewall"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {action} {ip} - {reason}"
+        if duration:
+            log_entry += f" (duration: {duration}s)"
+        
+        with open(Config.LOG_FILE, 'a') as f:
+            f.write(log_entry + '\n')
+        
+        self._print_alert(action, ip, reason)
+    
+    def _print_alert(self, action: str, ip: str, reason: str):
+        """Print colorido no console"""
+        colors = {
+            "BLOCK": "\033[91m",  # Red
+            "ALLOW": "\033[92m",  # Green
+            "ALERT": "\033[93m",  # Yellow
+            "UNBLOCK": "\033[94m",  # Blue
+            "CRITICAL": "\033[95m",  # Purple
+        }
+        color = colors.get(action, "\033[0m")
+        print(f"{color}[{action}] {ip} - {reason}\033[0m")
+
+
+# ============================================================================
+# INTRUSION DETECTION SYSTEM
+# ============================================================================
+
+class IDSEngine:
+    """Detecta padrões de ataque em tempo real"""
+    
+    def __init__(self, firewall: FirewallEngine):
+        self.firewall = firewall
+        self.tracker = AttackTracker()
+        self.alerts = []
+        self.lock = threading.Lock()
+        
+        # Padrões de brute force em payloads
+        self.brute_patterns = [
+            b"Failed password",
+            b"authentication failure",
+            b"Invalid user",
+            b"login incorrect",
+            b"Password wrong",
+            b"Access denied"
+        ]
+    
+    def add_alert(self, severity: str, attack_type: str, src_ip: str, dst_ip: str,
+                  details: str, packet_info: dict = None):
+        """Registra alerta de segurança"""
+        alert = {
+            "timestamp": datetime.now().isoformat(),
+            "severity": severity,  # LOW, MEDIUM, HIGH, CRITICAL
+            "type": attack_type,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "details": details,
+            "packet": packet_info
+        }
+        
+        with self.lock:
+            self.alerts.append(alert)
+            
+            # Salvar em arquivo
+            with open(Config.ALERT_LOG, 'a') as f:
+                f.write(json.dumps(alert) + '\n')
+            
+            # Print colorido
+            colors = {
+                "LOW": "\033[92m",
+                "MEDIUM": "\033[93m",
+                "HIGH": "\033[95m",
+                "CRITICAL": "\033[91m"
+            }
+            color = colors.get(severity, "\033[0m")
+            print(f"\n{color}🚨 ALERTA [{severity}] {attack_type}")
+            print(f"   De: {src_ip} | Para: {dst_ip}")
+            print(f"   {details}\033[0m")
+    
+    def detect_syn_flood(self, packet, src_ip: str, timestamp: float):
+        """Detecta SYN Flood attack"""
+        if not packet.haslayer(TCP):
+            return
+        
+        tcp = packet[TCP]
+        if tcp.flags & 0x02:  # SYN flag
+            self.tracker.add_syn_packet(src_ip, timestamp)
+            rate = self.tracker.get_syn_rate(src_ip)
+            
+            if rate > Config.SYN_FLOOD_THRESHOLD:
+                self.add_alert(
+                    "HIGH", "SYN_FLOOD", src_ip, packet[IP].dst,
+                    f"SYN rate: {rate} packets/second (threshold: {Config.SYN_FLOOD_THRESHOLD})"
+                )
+                self.firewall.block_ip(src_ip, f"SYN flood detected ({rate}/s)", 600)
+    
+    def detect_port_scan(self, packet, src_ip: str, timestamp: float):
+        """Detecta Port Scanning"""
+        if packet.haslayer(TCP):
+            dst_port = packet[TCP].dport
+        elif packet.haslayer(UDP):
+            dst_port = packet[UDP].dport
+        else:
+            return
+        
+        self.tracker.add_port_hit(src_ip, dst_port, timestamp)
+        unique_ports = self.tracker.get_unique_ports(src_ip, timestamp)
+        
+        if unique_ports >= Config.PORT_SCAN_THRESHOLD:
+            self.add_alert(
+                "MEDIUM", "PORT_SCAN", src_ip, packet[IP].dst,
+                f"Scanned {unique_ports} unique ports in {Config.PORT_SCAN_WINDOW}s"
+            )
+    
+    def detect_brute_force(self, packet, src_ip: str, dst_ip: str, timestamp: float):
+        """Detecta Brute Force attempts"""
+        if not packet.haslayer(Raw):
+            return
+        
+        payload = packet[Raw].load
+        payload_lower = payload.lower()
+        
+        # Verificar padrões de falha de autenticação
+        for pattern in self.brute_patterns:
+            if pattern in payload or pattern.lower() in payload_lower:
+                self.tracker.add_auth_failure(src_ip, timestamp)
+                failures = self.tracker.get_auth_failures(src_ip)
+                
+                if failures >= Config.BRUTE_FORCE_THRESHOLD:
+                    self.add_alert(
+                        "HIGH", "BRUTE_FORCE", src_ip, dst_ip,
+                        f"{failures} failed authentication attempts in {Config.BRUTE_FORCE_WINDOW}s"
+                    )
+                    self.firewall.block_ip(src_ip, f"Brute force detected ({failures} attempts)", 900)
+                break
+    
+    def detect_rate_limit_exceeded(self, packet, src_ip: str, timestamp: float):
+        """Detecta excesso de taxa de pacotes"""
+        self.tracker.add_packet(src_ip, timestamp)
+        rate = self.tracker.get_packet_rate(src_ip)
+        
+        if rate > Config.RATE_LIMIT:
+            self.add_alert(
+                "MEDIUM", "RATE_LIMIT_EXCEEDED", src_ip, packet[IP].dst,
+                f"Packet rate: {rate}/s (limit: {Config.RATE_LIMIT}/s)"
+            )
+            self.firewall.block_ip(src_ip, f"Rate limit exceeded ({rate}/s)", 120)
+    
+    def detect_known_attacks(self, packet, src_ip: str, dst_ip: str):
+        """Detecta assinaturas conhecidas de ataque"""
+        if not packet.haslayer(Raw):
+            return
+        
+        payload = packet[Raw].load
+        payload_str = payload.decode('utf-8', errors='ignore').lower()
+        
+        # SQL Injection
+        sql_patterns = ["' or '1'='1", "union select", "drop table", "insert into"]
+        for pattern in sql_patterns:
+            if pattern in payload_str:
+                self.add_alert(
+                    "CRITICAL", "SQL_INJECTION", src_ip, dst_ip,
+                    f"SQL injection pattern detected: {pattern}"
+                )
+                self.firewall.block_ip(src_ip, "SQL injection attempt", 3600)
+                break
+        
+        # XSS
+        xss_patterns = ["<script>", "javascript:", "onload=", "alert("]
+        for pattern in xss_patterns:
+            if pattern in payload_str:
+                self.add_alert(
+                    "HIGH", "XSS_ATTEMPT", src_ip, dst_ip,
+                    f"XSS pattern detected: {pattern}"
+                )
+                break
+        
+        # Command Injection
+        cmd_patterns = ["; ls", "; cat", "| id", "&& whoami", "`ping"]
+        for pattern in cmd_patterns:
+            if pattern in payload_str:
+                self.add_alert(
+                    "CRITICAL", "COMMAND_INJECTION", src_ip, dst_ip,
+                    f"Command injection detected: {pattern}"
+                )
+                self.firewall.block_ip(src_ip, "Command injection attempt", 3600)
+                break
+    
+    def analyze_packet(self, packet, src_ip: str, dst_ip: str, timestamp: float):
+        """Análise completa do pacote"""
+        # Verificar se IP já está bloqueado
+        blocked, reason = self.firewall.is_blocked(src_ip)
+        if blocked:
+            return False, reason
+        
+        # Detecção de ataques
+        self.detect_syn_flood(packet, src_ip, timestamp)
+        self.detect_port_scan(packet, src_ip, timestamp)
+        self.detect_brute_force(packet, src_ip, dst_ip, timestamp)
+        self.detect_rate_limit_exceeded(packet, src_ip, timestamp)
+        self.detect_known_attacks(packet, src_ip, dst_ip)
+        
+        return True, "analyzed"
+
+
+# ============================================================================
+# SNIFFER E PROCESSAMENTO DE PACOTES
+# ============================================================================
+
+class PacketSniffer:
+    """Captura e processa pacotes de rede em tempo real"""
+    
+    def __init__(self, firewall: FirewallEngine, ids: IDSEngine):
+        self.firewall = firewall
+        self.ids = ids
+        self.running = False
+        self.packet_count = 0
+        self.dropped_count = 0
+        self.thread = None
+    
+    def process_packet(self, packet):
+        """Processa um pacote capturado"""
+        self.packet_count += 1
+        
+        if not packet.haslayer(IP):
+            return
+        
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+        
+        # Determinar porta de destino
+        dst_port = None
+        protocol = "OTHER"
+        if packet.haslayer(TCP):
+            dst_port = packet[TCP].dport
+            protocol = "TCP"
+        elif packet.haslayer(UDP):
+            dst_port = packet[UDP].dport
+            protocol = "UDP"
+        elif packet.haslayer(ICMP):
+            protocol = "ICMP"
+        
+        # Verificar firewall
+        if dst_port:
+            allowed, reason = self.firewall.check_packet(src_ip, dst_port, protocol)
+            if not allowed:
+                self.dropped_count += 1
+                return
+        
+        # Análise do IDS
+        timestamp = time.time()
+        self.ids.analyze_packet(packet, src_ip, dst_ip, timestamp)
+        
+        # Mostrar estatísticas periodicamente
+        if self.packet_count % 100 == 0:
+            self.print_stats()
+    
+    def print_stats(self):
+        """Mostra estatísticas do sniffer"""
+        print(f"\r\033[90m[STATS] Packets: {self.packet_count} | Dropped: {self.dropped_count}\033[0m", end='')
+    
+    def start_sniffing(self, interface: str = None, filter_str: str = None):
+        """Inicia captura de pacotes"""
+        if not SCAPY_AVAILABLE:
+            print("[ERROR] Scapy não disponível. Use -m sim para simulação.")
+            return
+        
+        self.running = True
+        iface = interface or Config.INTERFACE
+        filter_str = filter_str or Config.FILTER
+        
+        print(f"\n[+] Iniciando sniffer na interface {iface}")
+        print(f"[+] Filtro: {filter_str}")
+        print("[+] Pressione Ctrl+C para parar\n")
+        
+        try:
+            sniff(iface=iface, filter=filter_str, prn=self.process_packet, store=False)
+        except KeyboardInterrupt:
+            self.stop()
+        except Exception as e:
+            print(f"[ERROR] Erro no sniffer: {e}")
+    
+    def stop(self):
+        self.running = False
+        print(f"\n[+] Sniffer parado. Total pacotes: {self.packet_count}")
+        self.print_stats()
+
+
+# ============================================================================
+# MODO DE SIMULAÇÃO (quando Scapy não está disponível)
+# ============================================================================
+
+class SimulationMode:
+    """Modo de simulação usando arquivo PCAP ou geração de tráfego sintético"""
+    
+    def __init__(self, firewall: FirewallEngine, ids: IDSEngine):
+        self.firewall = firewall
+        self.ids = ids
+    
+    def generate_test_traffic(self):
+        """Gera tráfego de teste sintético"""
+        print("\n[SIM] Gerando tráfego de teste...")
+        
+        # Lista de IPs de teste
+        test_ips = [
+            "192.168.1.100",  # IP normal
+            "10.0.0.50",      # IP normal
+            "203.0.113.1",    # Atacante (port scan)
+            "203.0.113.2",    # Atacante (SYN flood)
+            "203.0.113.3",    # Atacante (brute force)
+        ]
+        
+        timestamp = time.time()
+        
+        # Simular port scan
+        print("[SIM] Simulando PORT SCAN de 203.0.113.1...")
+        for port in range(1, 30):
+            self.ids.tracker.add_port_hit("203.0.113.1", port, ti
