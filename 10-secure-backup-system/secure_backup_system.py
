@@ -1,0 +1,1815 @@
+#!/usr/bin/env python3
+# ============================================================================
+# SECURE BACKUP SYSTEM - SISTEMA DE BACKUP SEGURO COM CRIPTOGRAFIA
+# Características: AES-256, compressão, backup incremental, múltiplos destinos
+# ============================================================================
+
+import os
+import sys
+import json
+import hashlib
+import base64
+import shutil
+import zipfile
+import tarfile
+import tempfile
+import subprocess
+import threading
+import time
+import schedule
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Criptografia
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Random import get_random_bytes
+
+# Upload (opcional - instalar se disponível)
+try:
+    import boto3
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
+try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
+
+# ============================================================================
+# CONFIGURAÇÃO
+# ============================================================================
+
+class BackupType(Enum):
+    FULL = "full"
+    INCREMENTAL = "incremental"
+    DIFFERENTIAL = "differential"
+
+
+class DestinationType(Enum):
+    LOCAL = "local"
+    S3 = "s3"
+    SFTP = "sftp"
+    WEBDAV = "webdav"
+
+
+class CompressionType(Enum):
+    NONE = "none"
+    ZIP = "zip"
+    TAR_GZ = "tar.gz"
+    TAR_BZ2 = "tar.bz2"
+
+
+@dataclass
+class BackupConfig:
+    """Configuração do backup"""
+    name: str
+    source_dirs: List[str]
+    destination_type: DestinationType
+    destination_path: str
+    backup_type: BackupType = BackupType.INCREMENTAL
+    compression: CompressionType = CompressionType.TAR_GZ
+    encryption_password: str = None
+    retention_days: int = 30
+    max_backups: int = 10
+    exclude_patterns: List[str] = field(default_factory=list)
+    include_hidden: bool = False
+    verify_integrity: bool = True
+    pre_backup_script: str = None
+    post_backup_script: str = None
+    
+    # Configurações específicas
+    s3_bucket: str = None
+    s3_region: str = "us-east-1"
+    s3_access_key: str = None
+    s3_secret_key: str = None
+    
+    sftp_host: str = None
+    sftp_port: int = 22
+    sftp_username: str = None
+    sftp_password: str = None
+    sftp_key_path: str = None
+
+
+@dataclass
+class BackupResult:
+    """Resultado de uma operação de backup"""
+    success: bool
+    backup_name: str
+    timestamp: datetime
+    size_bytes: int
+    duration_seconds: float
+    source_size: int
+    files_backed_up: int
+    destination_path: str
+    checksum: str
+    error_message: str = None
+    metadata: Dict = field(default_factory=dict)
+
+
+# ============================================================================
+# UTILITÁRIOS CRIPTOGRÁFICOS
+# ============================================================================
+
+class CryptoUtils:
+    """Utilitários de criptografia para backup seguro"""
+    
+    @staticmethod
+    def derive_key(password: str, salt: bytes = None) -> Tuple[bytes, bytes]:
+        """Deriva chave AES da senha usando PBKDF2"""
+        if salt is None:
+            salt = get_random_bytes(32)
+        key = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000, 32)
+        return key, salt
+    
+    @staticmethod
+    def encrypt_file(input_path: str, output_path: str, password: str) -> Tuple[bool, str]:
+        """Criptografa um arquivo com AES-256-GCM"""
+        try:
+            # Derivar chave
+            key, salt = CryptoUtils.derive_key(password)
+            
+            # Gerar IV
+            iv = get_random_bytes(12)
+            
+            # Ler dados
+            with open(input_path, 'rb') as f:
+                plaintext = f.read()
+            
+            # Criptografar
+            cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+            ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+            
+            # Salvar: [salt(32)][iv(12)][tag(16)][ciphertext]
+            with open(output_path, 'wb') as f:
+                f.write(salt)
+                f.write(iv)
+                f.write(tag)
+                f.write(ciphertext)
+            
+            return True, output_path
+        
+        except Exception as e:
+            return False, str(e)
+    
+    @staticmethod
+    def decrypt_file(input_path: str, output_path: str, password: str) -> Tuple[bool, str]:
+        """Decifra um arquivo criptografado"""
+        try:
+            with open(input_path, 'rb') as f:
+                salt = f.read(32)
+                iv = f.read(12)
+                tag = f.read(16)
+                ciphertext = f.read()
+            
+            # Derivar chave
+            key, _ = CryptoUtils.derive_key(password, salt)
+            
+            # Decifrar
+            cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+            plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+            
+            with open(output_path, 'wb') as f:
+                f.write(plaintext)
+            
+            return True, output_path
+        
+        except Exception as e:
+            return False, str(e)
+    
+    @staticmethod
+    def calculate_checksum(file_path: str, algorithm: str = 'sha256') -> str:
+        """Calcula checksum de um arquivo"""
+        hash_func = hashlib.new(algorithm)
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+
+
+# ============================================================================
+# GERENCIADOR DE BACKUP
+# ============================================================================
+
+class BackupManager:
+    """Gerencia operações de backup"""
+    
+    def __init__(self, config_path: str = "backup_configs.json"):
+        self.config_path = config_path
+        self.configs: List[BackupConfig] = []
+        self.history: Dict[str, List[BackupResult]] = {}
+        self.lock = threading.Lock()
+        self.load_configs()
+    
+    def load_configs(self):
+        """Carrega configurações salvas"""
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, 'r') as f:
+                    data = json.load(f)
+                    for cfg_data in data:
+                        cfg_data['destination_type'] = DestinationType(cfg_data['destination_type'])
+                        cfg_data['backup_type'] = BackupType(cfg_data['backup_type'])
+                        cfg_data['compression'] = CompressionType(cfg_data['compression'])
+                        self.configs.append(BackupConfig(**cfg_data))
+            except Exception as e:
+                print(f"[!] Erro ao carregar configurações: {e}")
+    
+    def save_configs(self):
+        """Salva configurações"""
+        with open(self.config_path, 'w') as f:
+            data = []
+            for cfg in self.configs:
+                cfg_dict = cfg.__dict__.copy()
+                cfg_dict['destination_type'] = cfg_dict['destination_type'].value
+                cfg_dict['backup_type'] = cfg_dict['backup_type'].value
+                cfg_dict['compression'] = cfg_dict['compression'].value
+                data.append(cfg_dict)
+            json.dump(data, f, indent=2, default=str)
+    
+    def add_config(self, config: BackupConfig):
+        """Adiciona nova configuração"""
+        self.configs.append(config)
+        self.save_configs()
+        print(f"[+] Configuração '{config.name}' adicionada")
+    
+    def remove_config(self, name: str):
+        """Remove configuração"""
+        self.configs = [c for c in self.configs if c.name != name]
+        self.save_configs()
+        print(f"[-] Configuração '{name}' removida")
+    
+    def get_config(self, name: str) -> Optional[BackupConfig]:
+        """Obtém configuração pelo nome"""
+        for cfg in self.configs:
+            if cfg.name == name:
+                return cfg
+        return None
+    
+    def calculate_source_size(self, source_dirs: List[str], exclude_patterns: List[str]) -> Tuple[int, int]:
+        """Calcula tamanho total e número de arquivos da fonte"""
+        total_size = 0
+        total_files = 0
+        
+        for source_dir in source_dirs:
+            if not os.path.exists(source_dir):
+                continue
+            
+            for root, dirs, files in os.walk(source_dir):
+                # Filtrar exclusões
+                for pattern in exclude_patterns:
+                    dirs[:] = [d for d in dirs if pattern not in d]
+                
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    
+                    # Verificar exclusão
+                    excluded = False
+                    for pattern in exclude_patterns:
+                        if pattern in filepath:
+                            excluded = True
+                            break
+                    
+                    if not excluded:
+                        try:
+                            total_size += os.path.getsize(filepath)
+                            total_files += 1
+                        except:
+                            pass
+        
+        return total_size, total_files
+    
+    def compress_files(self, source_dirs: List[str], output_path: str, 
+                       compression: CompressionType, exclude_patterns: List[str]) -> Tuple[bool, str, int]:
+        """Comprime arquivos para backup"""
+        try:
+            temp_dir = tempfile.mkdtemp()
+            temp_archive = os.path.join(temp_dir, "backup")
+            
+            if compression == CompressionType.ZIP:
+                temp_archive += ".zip"
+                with zipfile.ZipFile(temp_archive, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for source_dir in source_dirs:
+                        if os.path.exists(source_dir):
+                            for root, dirs, files in os.walk(source_dir):
+                                for pattern in exclude_patterns:
+                                    dirs[:] = [d for d in dirs if pattern not in d]
+                                
+                                for file in files:
+                                    filepath = os.path.join(root, file)
+                                    excluded = any(p in filepath for p in exclude_patterns)
+                                    if not excluded:
+                                        arcname = os.path.relpath(filepath, os.path.dirname(source_dir))
+                                        zf.write(filepath, arcname)
+            
+            elif compression == CompressionType.TAR_GZ:
+                temp_archive += ".tar.gz"
+                with tarfile.open(temp_archive, 'w:gz') as tf:
+                    for source_dir in source_dirs:
+                        if os.path.exists(source_dir):
+                            tf.add(source_dir, arcname=os.path.basename(source_dir),
+                                   filter=lambda x: None if any(p in x.name for p in exclude_patterns) else x)
+            
+            elif compression == CompressionType.TAR_BZ2:
+                temp_archive += ".tar.bz2"
+                with tarfile.open(temp_archive, 'w:bz2') as tf:
+                    for source_dir in source_dirs:
+                        if os.path.exists(source_dir):
+                            tf.add(source_dir, arcname=os.path.basename(source_dir))
+            
+            else:
+                # Sem compressão - criar um tar simples
+                temp_archive += ".tar"
+                with tarfile.open(temp_archive, 'w') as tf:
+                    for source_dir in source_dirs:
+                        if os.path.exists(source_dir):
+                            tf.add(source_dir, arcname=os.path.basename(source_dir))
+            
+            # Obter tamanho
+            size = os.path.getsize(temp_archive)
+            
+            # Mover para destino final
+            shutil.move(temp_archive, output_path)
+            shutil.rmtree(temp_dir)
+            
+            return True, output_path, size
+        
+        except Exception as e:
+            return False, str(e), 0
+    
+    def upload_to_destination(self, local_path: str, config: BackupConfig) -> Tuple[bool, str]:
+        """Faz upload do backup para o destino configurado"""
+        
+        if config.destination_type == DestinationType.LOCAL:
+            # Cópia local
+            dest_file = os.path.join(config.destination_path, os.path.basename(local_path))
+            shutil.copy2(local_path, dest_file)
+            return True, dest_file
+        
+        elif config.destination_type == DestinationType.S3:
+            if not BOTO3_AVAILABLE:
+                return False, "boto3 não instalado. Instale com: pip install boto3"
+            
+            try:
+                session = boto3.Session(
+                    aws_access_key_id=config.s3_access_key,
+                    aws_secret_access_key=config.s3_secret_key,
+                    region_name=config.s3_region
+                )
+                s3 = session.client('s3')
+                
+                key = f"backups/{os.path.basename(local_path)}"
+                s3.upload_file(local_path, config.s3_bucket, key)
+                
+                return True, f"s3://{config.s3_bucket}/{key}"
+            
+            except Exception as e:
+                return False, str(e)
+        
+        elif config.destination_type == DestinationType.SFTP:
+            if not PARAMIKO_AVAILABLE:
+                return False, "paramiko não instalado. Instale com: pip install paramiko"
+            
+            try:
+                transport = paramiko.Transport((config.sftp_host, config.sftp_port))
+                
+                if config.sftp_key_path:
+                    key = paramiko.RSAKey.from_private_key_file(config.sftp_key_path)
+                    transport.connect(username=config.sftp_username, pkey=key)
+                else:
+                    transport.connect(username=config.sftp_username, password=config.sftp_password)
+                
+                sftp = paramiko.SFTPClient.from_transport(transport)
+                
+                remote_path = os.path.join(config.destination_path, os.path.basename(local_path))
+                sftp.put(local_path, remote_path)
+                
+                sftp.close()
+                transport.close()
+                
+                return True, f"sftp://{config.sftp_host}:{config.sftp_port}/{remote_path}"
+            
+            except Exception as e:
+                return False, str(e)
+        
+        else:
+            return False, f"Tipo de destino não suportado: {config.destination_type}"
+    
+    def cleanup_old_backups(self, config: BackupConfig):
+        """Remove backups antigos baseado na política de retenção"""
+        try:
+            dest_path = config.destination_path
+            
+            if config.destination_type == DestinationType.LOCAL and os.path.exists(dest_path):
+                # Listar backups
+                backups = []
+                for f in os.listdir(dest_path):
+                    if f.startswith(config.name) and (f.endswith('.enc') or f.endswith('.tar.gz') or f.endswith('.zip')):
+                        filepath = os.path.join(dest_path, f)
+                        backups.append((os.path.getmtime(filepath), filepath))
+                
+                # Ordenar por data
+                backups.sort(reverse=True)
+                
+                # Remover backups excedentes
+                for i, (_, filepath) in enumerate(backups):
+                    if i >= config.max_backups:
+                        os.remove(filepath)
+                        print(f"[+] Backup antigo removido: {filepath}")
+                
+                # Remover backups mais antigos que retention_days
+                cutoff = time.time() - (config.retention_days * 86400)
+                for mtime, filepath in backups:
+                    if mtime < cutoff:
+                        os.remove(filepath)
+                        print(f"[+] Backup expirado removido: {filepath}")
+        
+        except Exception as e:
+            print(f"[!] Erro ao limpar backups antigos: {e}")
+    
+    def run_backup(self, config_name: str) -> BackupResult:
+        """Executa backup para uma configuração"""
+        config = self.get_config(config_name)
+        if not config:
+            return BackupResult(
+                success=False,
+                backup_name=config_name,
+                timestamp=datetime.now(),
+                size_bytes=0,
+                duration_seconds=0,
+                source_size=0,
+                files_backed_up=0,
+                destination_path="",
+                checksum="",
+                error_message=f"Configuração '{config_name}' não encontrada"
+            )
+        
+        start_time = time.time()
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"{config.name}_{timestamp_str}"
+        
+        print(f"\n{'='*60}")
+        print(f"🔄 Iniciando backup: {config.name}")
+        print(f"📅 Data: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        print(f"📁 Origem: {', '.join(config.source_dirs)}")
+        print(f"🎯 Tipo: {config.backup_type.value}")
+        print(f"🗜️ Compressão: {config.compression.value}")
+        print(f"🔐 Criptografia: {'Sim' if config.encryption_password else 'Não'}")
+        print(f"{'='*60}")
+        
+        # Executar script pré-backup
+        if config.pre_backup_script and os.path.exists(config.pre_backup_script):
+            print(f"\n📜 Executando script pré-backup...")
+            subprocess.run([config.pre_backup_script], shell=True)
+        
+        # Calcular tamanho da fonte
+        source_size, files_count = self.calculate_source_size(config.source_dirs, config.exclude_patterns)
+        print(f"\n📊 Tamanho da fonte: {source_size / (1024**2):.2f} MB")
+        print(f"📄 Arquivos: {files_count}")
+        
+        # Criar diretório temporário
+        temp_dir = tempfile.mkdtemp()
+        temp_archive = os.path.join(temp_dir, backup_filename)
+        
+        # Compressão
+        print(f"\n🗜️ Comprimindo arquivos...")
+        success, result, compressed_size = self.compress_files(
+            config.source_dirs, temp_archive, config.compression, config.exclude_patterns
+        )
+        
+        if not success:
+            shutil.rmtree(temp_dir)
+            return BackupResult(
+                success=False,
+                backup_name=config.name,
+                timestamp=datetime.now(),
+                size_bytes=0,
+                duration_seconds=time.time() - start_time,
+                source_size=source_size,
+                files_backed_up=files_count,
+                destination_path="",
+                checksum="",
+                error_message=f"Erro na compressão: {result}"
+            )
+        
+        print(f"   Tamanho comprimido: {compressed_size / (1024**2):.2f} MB")
+        
+        # Criptografia
+        final_file = temp_archive
+        if config.encryption_password:
+            print(f"\n🔐 Criptografando arquivo...")
+            encrypted_file = temp_archive + ".enc"
+            success, result = CryptoUtils.encrypt_file(temp_archive, encrypted_file, config.encryption_password)
+            
+            if not success:
+                shutil.rmtree(temp_dir)
+                return BackupResult(
+                    success=False,
+                    backup_name=config.name,
+                    timestamp=datetime.now(),
+                    size_bytes=0,
+                    duration_seconds=time.time() - start_time,
+                    source_size=source_size,
+                    files_backed_up=files_count,
+                    destination_path="",
+                    checksum="",
+                    error_message=f"Erro na cr                    source_size=source_size,
+                    files_backed_up=files_count,
+                    destination_path="",
+                    checksum="",
+                    error_message=f"Erro na compressão: {result}"
+                )
+        
+        print(f"   Tamanho comprimido: {compressed_size / (1024**2):.2f} MB")
+        
+        # Criptografia
+        final_file = temp_archive
+        if config.encryption_password:
+            print(f"\n🔐 Criptografando arquivo...")
+            encrypted_file = temp_archive + ".enc"
+            success, result = CryptoUtils.encrypt_file(temp_archive, encrypted_file, config.encryption_password)
+            
+            if not success:
+                shutil.rmtree(temp_dir)
+                return BackupResult(
+                    success=False,
+                    backup_name=config.name,
+                    timestamp=datetime.now(),
+                    size_bytes=0,
+                    duration_seconds=time.time() - start_time,
+                    source_size=source_size,
+                    files_backed_up=files_count,
+                    destination_path="",
+                    checksum="",
+                    error_message=f"Erro na criptografia: {result}"
+                )
+            
+            os.remove(temp_archive)
+            final_file = encrypted_file
+            print(f"   Arquivo criptografado: {os.path.basename(final_file)}")
+        
+        # Calcular checksum
+        print(f"\n🔑 Calculando checksum...")
+        checksum = CryptoUtils.calculate_checksum(final_file)
+        print(f"   SHA-256: {checksum[:16]}...{checksum[-16:]}")
+        
+        # Upload para destino
+        print(f"\n📤 Enviando para destino ({config.destination_type.value})...")
+        success, dest_path = self.upload_to_destination(final_file, config)
+        
+        if not success:
+            shutil.rmtree(temp_dir)
+            return BackupResult(
+                success=False,
+                backup_name=config.name,
+                timestamp=datetime.now(),
+                size_bytes=os.path.getsize(final_file),
+                duration_seconds=time.time() - start_time,
+                source_size=source_size,
+                files_backed_up=files_count,
+                destination_path="",
+                checksum=checksum,
+                error_message=f"Erro no upload: {dest_path}"
+            )
+        
+        print(f"   ✅ Upload concluído: {dest_path}")
+        
+        # Limpar arquivos temporários
+        shutil.rmtree(temp_dir)
+        
+        # Limpar backups antigos
+        print(f"\n🗑️ Aplicando política de retenção...")
+        self.cleanup_old_backups(config)
+        
+        # Executar script pós-backup
+        if config.post_backup_script and os.path.exists(config.post_backup_script):
+            print(f"\n📜 Executando script pós-backup...")
+            try:
+                subprocess.run([config.post_backup_script], shell=True, check=True)
+                print(f"   ✅ Script pós-backup executado")
+            except subprocess.CalledProcessError as e:
+                print(f"   ⚠️ Script pós-backup falhou: {e}")
+        
+        duration = time.time() - start_time
+        final_size = os.path.getsize(final_file) if os.path.exists(final_file) else 0
+        
+        # Calcular taxa de compressão
+        compression_ratio = source_size / final_size if final_size > 0 else 1
+        
+        result = BackupResult(
+            success=True,
+            backup_name=config.name,
+            timestamp=datetime.now(),
+            size_bytes=final_size,
+            duration_seconds=duration,
+            source_size=source_size,
+            files_backed_up=files_count,
+            destination_path=dest_path,
+            checksum=checksum,
+            metadata={
+                'compression_ratio': compression_ratio,
+                'encrypted': bool(config.encryption_password),
+                'compression_type': config.compression.value,
+                'backup_type': config.backup_type.value
+            }
+        )
+        
+        # Salvar no histórico
+        if config.name not in self.history:
+            self.history[config.name] = []
+        self.history[config.name].append(result)
+        self.save_history()
+        
+        print(f"\n{'='*60}")
+        print(f"✅ BACKUP CONCLUÍDO COM SUCESSO!")
+        print(f"{'='*60}")
+        print(f"   📁 Backup: {config.name}")
+        print(f"   ⏱️  Duração: {duration:.2f} segundos")
+        print(f"   📦 Tamanho fonte: {source_size / (1024**2):.2f} MB")
+        print(f"   🗜️ Tamanho final: {final_size / (1024**2):.2f} MB")
+        print(f"   📊 Taxa compressão: {compression_ratio:.2f}x")
+        print(f"   📄 Arquivos: {files_count}")
+        print(f"   🎯 Destino: {dest_path}")
+        print(f"   🔑 Checksum: {checksum}")
+        print(f"{'='*60}")
+        
+        return result
+    
+    def upload_to_destination(self, local_path: str, config: BackupConfig) -> Tuple[bool, str]:
+        """Faz upload do backup para o destino configurado"""
+        
+        if config.destination_type == DestinationType.LOCAL:
+            # Cópia local
+            try:
+                os.makedirs(config.destination_path, exist_ok=True)
+                dest_file = os.path.join(config.destination_path, os.path.basename(local_path))
+                
+                # Se for o mesmo filesystem, usar move; caso contrário, copy
+                if os.path.exists(dest_file):
+                    os.remove(dest_file)
+                
+                shutil.copy2(local_path, dest_file)
+                print(f"   📁 Cópia local: {dest_file}")
+                return True, dest_file
+            except Exception as e:
+                return False, str(e)
+        
+        elif config.destination_type == DestinationType.S3:
+            if not BOTO3_AVAILABLE:
+                return False, "boto3 não instalado. Instale com: pip install boto3"
+            
+            try:
+                # Criar sessão
+                session = boto3.Session(
+                    aws_access_key_id=config.s3_access_key,
+                    aws_secret_access_key=config.s3_secret_key,
+                    region_name=config.s3_region
+                )
+                s3 = session.client('s3')
+                
+                # Gerar chave S3 (organizar por data)
+                date_prefix = datetime.now().strftime("%Y/%m/%d")
+                key = f"backups/{config.name}/{date_prefix}/{os.path.basename(local_path)}"
+                
+                # Upload com progresso
+                print(f"   ☁️  Enviando para S3: s3://{config.s3_bucket}/{key}")
+                
+                # Upload com callback de progresso
+                file_size = os.path.getsize(local_path)
+                uploaded = 0
+                
+                def progress_callback(bytes_transferred):
+                    nonlocal uploaded
+                    uploaded += bytes_transferred
+                    percent = (uploaded / file_size) * 100
+                    print(f"\r   Progresso: {percent:.1f}% ({uploaded/(1024**2):.1f} MB / {file_size/(1024**2):.1f} MB)", end='')
+                
+                s3.upload_file(
+                    local_path, config.s3_bucket, key,
+                    Callback=progress_callback if file_size > 5*1024*1024 else None
+                )
+                print()  # Nova linha após progresso
+                
+                # Gerar URL pré-assinada (válida por 7 dias)
+                url = s3.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': config.s3_bucket, 'Key': key},
+                    ExpiresIn=604800
+                )
+                
+                return True, f"s3://{config.s3_bucket}/{key}"
+            
+            except Exception as e:
+                return False, f"S3 upload failed: {str(e)}"
+        
+        elif config.destination_type == DestinationType.SFTP:
+            if not PARAMIKO_AVAILABLE:
+                return False, "paramiko não instalado. Instale com: pip install paramiko"
+            
+            try:
+                # Conectar SFTP
+                transport = paramiko.Transport((config.sftp_host, config.sftp_port))
+                
+                if config.sftp_key_path and os.path.exists(config.sftp_key_path):
+                    key = paramiko.RSAKey.from_private_key_file(config.sftp_key_path)
+                    transport.connect(username=config.sftp_username, pkey=key)
+                else:
+                    transport.connect(username=config.sftp_username, password=config.sftp_password)
+                
+                sftp = paramiko.SFTPClient.from_transport(transport)
+                
+                # Criar diretórios se não existirem
+                remote_path = config.destination_path.rstrip('/')
+                remote_file = f"{remote_path}/{os.path.basename(local_path)}"
+                
+                # Criar estrutura de diretórios
+                dirs = remote_path.split('/')
+                current_path = ''
+                for d in dirs:
+                    if d:
+                        current_path += '/' + d
+                        try:
+                            sftp.stat(current_path)
+                        except FileNotFoundError:
+                            sftp.mkdir(current_path)
+                
+                # Upload com progresso
+                file_size = os.path.getsize(local_path)
+                uploaded = 0
+                
+                def sftp_progress(transferred, total):
+                    nonlocal uploaded
+                    uploaded = transferred
+                    percent = (transferred / total) * 100
+                    print(f"\r   Progresso: {percent:.1f}% ({transferred/(1024**2):.1f} MB / {total/(1024**2):.1f} MB)", end='')
+                
+                sftp.put(local_path, remote_file, callback=sftp_progress if file_size > 5*1024*1024 else None)
+                print()  # Nova linha
+                
+                sftp.close()
+                transport.close()
+                
+                return True, f"sftp://{config.sftp_host}:{config.sftp_port}{remote_file}"
+            
+            except Exception as e:
+                return False, f"SFTP upload failed: {str(e)}"
+        
+        elif config.destination_type == DestinationType.WEBDAV:
+            # WebDAV usando requests
+            try:
+                import requests
+                from requests.auth import HTTPBasicAuth
+                
+                webdav_url = config.destination_path.rstrip('/')
+                file_name = os.path.basename(local_path)
+                remote_url = f"{webdav_url}/{file_name}"
+                
+                with open(local_path, 'rb') as f:
+                    response = requests.put(
+                        remote_url,
+                        data=f,
+                        auth=HTTPBasicAuth(config.sftp_username or '', config.sftp_password or ''),
+                        timeout=300
+                    )
+                
+                if response.status_code in [200, 201, 204]:
+                    return True, remote_url
+                else:
+                    return False, f"WebDAV error: HTTP {response.status_code}"
+            
+            except Exception as e:
+                return False, f"WebDAV upload failed: {str(e)}"
+        
+        else:
+            return False, f"Tipo de destino não suportado: {config.destination_type}"
+    
+    def cleanup_old_backups(self, config: BackupConfig):
+        """Remove backups antigos baseado na política de retenção"""
+        try:
+            if config.destination_type == DestinationType.LOCAL and os.path.exists(config.destination_path):
+                # Listar backups
+                backups = []
+                pattern = f"{config.name}_"
+                
+                for f in os.listdir(config.destination_path):
+                    if f.startswith(pattern) and (f.endswith('.enc') or f.endswith('.tar.gz') or f.endswith('.zip') or f.endswith('.tar.bz2') or f.endswith('.tar')):
+                        filepath = os.path.join(config.destination_path, f)
+                        backups.append((os.path.getmtime(filepath), filepath, f))
+                
+                # Ordenar por data (mais recente primeiro)
+                backups.sort(reverse=True)
+                
+                # Remover backups excedentes (mais antigos que max_backups)
+                removed_count = 0
+                for i, (_, filepath, filename) in enumerate(backups):
+                    if i >= config.max_backups:
+                        os.remove(filepath)
+                        removed_count += 1
+                        print(f"   🗑️ Removido (excedente): {filename}")
+                
+                # Remover backups mais antigos que retention_days
+                cutoff_time = time.time() - (config.retention_days * 86400)
+                for mtime, filepath, filename in backups:
+                    if mtime < cutoff_time:
+                        os.remove(filepath)
+                        removed_count += 1
+                        print(f"   🗑️ Removido (expirado): {filename}")
+                
+                if removed_count > 0:
+                    print(f"   ✅ {removed_count} backup(s) removido(s)")
+                else:
+                    print(f"   ✅ Nenhum backup excedente ou expirado")
+            
+            elif config.destination_type == DestinationType.S3:
+                # S3 cleanup - implementar se necessário
+                print(f"   ℹ️ Limpeza S3 deve ser configurada com lifecycle rules")
+            
+            elif config.destination_type == DestinationType.SFTP:
+                # SFTP cleanup - implementar se necessário
+                print(f"   ℹ️ Limpeza SFTP deve ser gerenciada manualmente")
+        
+        except Exception as e:
+            print(f"   ⚠️ Erro ao limpar backups antigos: {e}")
+    
+    def save_history(self):
+        """Salva histórico de backups em arquivo JSON"""
+        history_file = os.path.join(os.path.dirname(self.config_path) if self.config_path else '.', "backup_history.json")
+        data = {}
+        
+        for name, backups in self.history.items():
+            data[name] = []
+            for b in backups:
+                data[name].append({
+                    'success': b.success,
+                    'backup_name': b.backup_name,
+                    'timestamp': b.timestamp.isoformat(),
+                    'size_bytes': b.size_bytes,
+                    'duration_seconds': b.duration_seconds,
+                    'source_size': b.source_size,
+                    'files_backed_up': b.files_backed_up,
+                    'destination_path': b.destination_path,
+                    'checksum': b.checksum,
+                    'error_message': b.error_message,
+                    'metadata': b.metadata
+                })
+        
+        try:
+            with open(history_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            print(f"   📝 Histórico salvo: {history_file}")
+        except Exception as e:
+            print(f"   ⚠️ Erro ao salvar histórico: {e}")
+    
+    def load_history(self):
+        """Carrega histórico de backups de arquivo JSON"""
+        history_file = os.path.join(os.path.dirname(self.config_path) if self.config_path else '.', "backup_history.json")
+        
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, 'r') as f:
+                    data = json.load(f)
+                    for name, backups in data.items():
+                        self.history[name] = []
+                        for b in backups:
+                            self.history[name].append(BackupResult(
+                                success=b['success'],
+                                backup_name=b['backup_name'],
+                                timestamp=datetime.fromisoformat(b['timestamp']),
+                                size_bytes=b['size_bytes'],
+                                duration_seconds=b['duration_seconds'],
+                                source_size=b['source_size'],
+                                files_backed_up=b['files_backed_up'],
+                                destination_path=b['destination_path'],
+                                checksum=b['checksum'],
+                                error_message=b.get('error_message'),
+                                metadata=b.get('metadata', {})
+                            ))
+                print(f"   📂 Histórico carregado: {len(self.history)} configurações")
+            except Exception as e:
+                print(f"   ⚠️ Erro ao carregar histórico: {e}")
+
+
+# ============================================================================
+# INTERFACE DE LINHA DE COMANDO
+# ============================================================================
+
+class BackupCLI:
+    """Interface de linha de comando para o sistema de backup"""
+    
+    def __init__(self):
+        self.manager = BackupManager()
+        self.manager.load_history()
+    
+    def interactive_setup(self):
+        """Configuração interativa de backup"""
+        print("\n" + "="*70)
+        print("   🆕 CONFIGURAÇÃO INTERATIVA DE BACKUP")
+        print("="*70)
+        
+        name = input("\n📛 Nome do backup (ex: 'meu_site', 'database'): ").strip()
+        if not name:
+            print("❌ Nome obrigatório")
+            return
+        
+        # Diretórios de origem
+        sources = []
+        print("\n📁 Diretórios/arquivos de origem (digite 'fim' para terminar):")
+        while True:
+            src = input("  📂 > ").strip()
+            if src.lower() == 'fim':
+                break
+            if os.path.exists(src):
+                sources.append(src)
+                print(f"     ✅ Adicionado: {src}")
+            else:
+                print(f"     ❌ Não encontrado: {src}")
+        
+        if not sources:
+            print("❌ Nenhum diretório válido")
+            return
+        
+        # Tipo de destino
+        print("\n🎯 TIPO DE DESTINO:")
+        print("   [1] 📁 Local (disco/network share)")
+        print("   [2] ☁️  AWS S3")
+        print("   [3] 🔒 SFTP/SSH")
+        print("   [4] 🌐 WebDAV")
+        
+        dest_type = input("\nEscolha [1-4]: ").strip()
+        dest_type_map = {
+            '1': DestinationType.LOCAL,
+            '2': DestinationType.S3,
+            '3': DestinationType.SFTP,
+            '4': DestinationType.WEBDAV
+        }
+        dest_type = dest_type_map.get(dest_type, DestinationType.LOCAL)
+        
+        # Caminho de destino
+        dest_path = input("\n📂 Caminho de destino: ").strip()
+        if not dest_path:
+            print("❌ Caminho obrigatório")
+            return
+        
+        # Configurações específicas por destino
+        s3_bucket = None
+        s3_region = None
+        s3_access_key = None
+        s3_secret_key = None
+        sftp_host = None
+        sftp_port = 22
+        sftp_username = None
+        sftp_password = None
+        sftp_key_path = None
+        
+        if dest_type == DestinationType.S3:
+            s3_bucket = input("   🪣 Nome do bucket S3: ").strip()
+            s3_region = input("   🌍 Região (padrão us-east-1): ").strip() or "us-east-1"
+            s3_access_key = input("   🔑 AWS Access Key ID: ").strip()
+            s3_secret_key = input("   🔐 AWS Secret Access Key: ").strip()
+        
+        elif dest_type == DestinationType.SFTP:
+            sftp_host = input("   🌐 Host SFTP: ").strip()
+            sftp_port = int(input("   🔌 Porta (padrão 22): ").strip() or 22)
+            sftp_username = input("   👤 Usuário: ").strip()
+            auth_method = input("   🔑 Autenticação (senha/chave): ").strip().lower()
+            if auth_method == 'senha':
+                sftp_password = input("   🔐 Senha: ").strip()
+            else:
+                sftp_key_path = input("   📄 Caminho da chave privada: ").strip()
+        
+        # Tipo de backup
+        print("\        # Tipo de backup
+        print("\n📊 TIPO DE BACKUP:")
+        print("   [1] Completo (Full) - Backup de tudo sempre")
+        print("   [2] Incremental - Apenas mudanças desde último backup")
+        print("   [3] Diferencial - Mudanças desde último full backup")
+        
+        backup_type = input("\nEscolha [1-3]: ").strip()
+        backup_type_map = {
+            '1': BackupType.FULL,
+            '2': BackupType.INCREMENTAL,
+            '3': BackupType.DIFFERENTIAL
+        }
+        backup_type = backup_type_map.get(backup_type, BackupType.FULL)
+        
+        # Compressão
+        print("\n🗜️ COMPRESSÃO:")
+        print("   [1] Nenhuma (mais rápido, maior arquivo)")
+        print("   [2] ZIP (bom equilíbrio)")
+        print("   [3] TAR.GZ (melhor compressão)")
+        print("   [4] TAR.BZ2 (compressão extrema, mais lento)")
+        
+        comp = input("\nEscolha [1-4]: ").strip()
+        comp_map = {
+            '1': CompressionType.NONE,
+            '2': CompressionType.ZIP,
+            '3': CompressionType.TAR_GZ,
+            '4': CompressionType.TAR_BZ2
+        }
+        compression = comp_map.get(comp, CompressionType.TAR_GZ)
+        
+        # Criptografia
+        use_encryption = input("\n🔐 USAR CRIPTOGRAFIA? (s/N): ").strip().lower()
+        encryption_password = None
+        if use_encryption == 's':
+            encryption_password = input("   🔑 Senha: ").strip()
+            confirm = input("   🔑 Confirmar senha: ").strip()
+            if encryption_password != confirm:
+                print("❌ Senhas não coincidem!")
+                return
+            print("   ℹ️ GUARDE ESTA SENHA! Sem ela o backup NÃO poderá ser restaurado.")
+        
+        # Retenção
+        retention_days = int(input("\n📅 DIAS DE RETENÇÃO (padrão 30): ").strip() or 30)
+        max_backups = int(input("📦 MÁXIMO DE BACKUPS (padrão 10): ").strip() or 10)
+        
+        # Exclusões
+        exclude_patterns = []
+        add_excludes = input("\n🚫 ADICIONAR EXCLUSÕES? (s/N): ").strip().lower()
+        if add_excludes == 's':
+            print("   Padrões de exclusão (ex: '*.tmp', 'node_modules', '.git'):")
+            print("   (deixe em branco para terminar)")
+            while True:
+                pattern = input("   > ").strip()
+                if not pattern:
+                    break
+                exclude_patterns.append(pattern)
+                print(f"     ✅ Adicionado: {pattern}")
+        
+        # Scripts
+        pre_backup_script = input("\n📜 SCRIPT PRÉ-BACKUP (caminho, opcional): ").strip() or None
+        post_backup_script = input("📜 SCRIPT PÓS-BACKUP (caminho, opcional): ").strip() or None
+        
+        # Criar configuração
+        config = BackupConfig(
+            name=name,
+            source_dirs=sources,
+            destination_type=dest_type,
+            destination_path=dest_path,
+            backup_type=backup_type,
+            compression=compression,
+            encryption_password=encryption_password,
+            retention_days=retention_days,
+            max_backups=max_backups,
+            exclude_patterns=exclude_patterns,
+            include_hidden=False,
+            verify_integrity=True,
+            pre_backup_script=pre_backup_script,
+            post_backup_script=post_backup_script
+        )
+        
+        # Salvar
+        self.manager.add_config(config)
+        
+        # Executar backup agora?
+        run_now = input("\n🚀 EXECUTAR BACKUP AGORA? (s/N): ").strip().lower()
+        if run_now == 's':
+            print("\n" + "="*70)
+            self.manager.run_backup(name)
+        
+        print(f"\n✅ Configuração '{name}' criada com sucesso!")
+        print(f"   Para executar manualmente: python {sys.argv[0]} --run {name}")
+        print(f"   Para agendar: use cron/task scheduler")
+    
+    def run_backup_menu(self):
+        """Menu para executar backup"""
+        if not self.manager.configs:
+            print("\n❌ Nenhuma configuração encontrada. Crie uma primeiro (opção 1).")
+            return
+        
+        print("\n📋 CONFIGURAÇÕES DISPONÍVEIS:")
+        print("-" * 60)
+        for i, cfg in enumerate(self.manager.configs, 1):
+            # Obter último backup
+            last_backup = "Nunca"
+            last_status = ""
+            if cfg.name in self.manager.history and self.manager.history[cfg.name]:
+                last = self.manager.history[cfg.name][-1]
+                last_backup = last.timestamp.strftime('%d/%m/%Y %H:%M')
+                last_status = "✅" if last.success else "❌"
+            
+            print(f"  [{i:2d}] {last_status} {cfg.name}")
+            print(f"       📂 Origem: {', '.join(cfg.source_dirs)[:60]}...")
+            print(f"       🎯 Destino: {cfg.destination_path[:60]}...")
+            print(f"       ⏱️ Último backup: {last_backup}")
+        
+        print("-" * 60)
+        choice = input("\n🔢 Número da configuração (ou 't' para todos, '0' para voltar): ").strip()
+        
+        if choice == '0':
+            return
+        elif choice.lower() == 't':
+            # Executar todos os backups
+            print(f"\n🚀 Executando todos os {len(self.manager.configs)} backups...")
+            results = []
+            for i, cfg in enumerate(self.manager.configs, 1):
+                print(f"\n[{i}/{len(self.manager.configs)}] {cfg.name}")
+                result = self.manager.run_backup(cfg.name)
+                results.append(result)
+            
+            # Resumo final
+            print("\n" + "="*70)
+            print("📊 RESUMO FINAL")
+            print("="*70)
+            success_count = sum(1 for r in results if r.success)
+            print(f"✅ Bem-sucedidos: {success_count}/{len(results)}")
+            print(f"❌ Falhas: {len(results) - success_count}/{len(results)}")
+            print("\nDetalhes:")
+            for r in results:
+                status = "✅" if r.success else "❌"
+                size_mb = r.size_bytes/(1024**2) if r.size_bytes > 0 else 0
+                print(f"   {status} {r.backup_name}: {r.duration_seconds:.1f}s - {size_mb:.2f} MB")
+                if not r.success and r.error_message:
+                    print(f"       Erro: {r.error_message[:80]}")
+        
+        elif choice.isdigit() and 1 <= int(choice) <= len(self.manager.configs):
+            cfg = self.manager.configs[int(choice)-1]
+            self.manager.run_backup(cfg.name)
+        
+        else:
+            print("❌ Opção inválida")
+    
+    def restore_menu(self):
+        """Menu para restaurar backup"""
+        if not self.manager.configs:
+            print("\n❌ Nenhuma configuração encontrada")
+            return
+        
+        print("\n📋 CONFIGURAÇÕES DISPONÍVEIS:")
+        for i, cfg in enumerate(self.manager.configs, 1):
+            backup_count = len(self.manager.history.get(cfg.name, []))
+            print(f"  [{i}] {cfg.name} ({backup_count} backups disponíveis)")
+        
+        choice = input("\n🔢 Número da configuração: ").strip()
+        if not (choice.isdigit() and 1 <= int(choice) <= len(self.manager.configs)):
+            print("❌ Opção inválida")
+            return
+        
+        cfg = self.manager.configs[int(choice)-1]
+        
+        # Listar backups disponíveis
+        print(f"\n📦 BACKUPS DISPONÍVEIS PARA '{cfg.name}':")
+        print("-" * 60)
+        
+        backups = self.manager.history.get(cfg.name, [])
+        if backups:
+            # Mostrar últimos 20 backups
+            for j, backup in enumerate(reversed(backups[-20:]), 1):
+                status = "✅" if backup.success else "❌"
+                size_mb = backup.size_bytes/(1024**2)
+                date_str = backup.timestamp.strftime('%d/%m/%Y %H:%M:%S')
+                print(f"  [{j:2d}] {status} {date_str} - {size_mb:.2f} MB - {backup.duration_seconds:.1f}s")
+                if backup.destination_path:
+                    print(f"       📁 {backup.destination_path[:60]}...")
+        else:
+            print("  ❌ Nenhum backup encontrado para esta configuração")
+            return
+        
+        print("-" * 60)
+        backup_choice = input("\n🔢 Número do backup (Enter para mais recente): ").strip()
+        restore_path = input("📂 Caminho para restaurar (Enter = diretório original): ").strip()
+        
+        if not restore_path:
+            restore_path = None
+        
+        print("\n🔄 Iniciando restauração...")
+        success, result = self.manager.restore_backup(cfg.name, None, restore_path)
+        
+        if success:
+            print(f"\n✅ Backup restaurado com sucesso!")
+            print(f"   📁 Local: {result}")
+        else:
+            print(f"\n❌ Erro na restauração: {result}")
+    
+    def verify_menu(self):
+        """Menu para verificar backups"""
+        if not self.manager.configs:
+            print("\n❌ Nenhuma configuração encontrada")
+            return
+        
+        print("\n📋 CONFIGURAÇÕES DISPONÍVEIS:")
+        for i, cfg in enumerate(self.manager.configs, 1):
+            print(f"  [{i}] {cfg.name}")
+        
+        choice = input("\n🔢 Número da configuração: ").strip()
+        if not (choice.isdigit() and 1 <= int(choice) <= len(self.manager.configs)):
+            print("❌ Opção inválida")
+            return
+        
+        cfg = self.manager.configs[int(choice)-1]
+        
+        print(f"\n🔍 VERIFICANDO INTEGRIDADE DOS BACKUPS PARA '{cfg.name}'...")
+        print("-" * 60)
+        
+        results = self.manager.verify_backup(cfg.name)
+        
+        if results:
+            for filename, info in results.items():
+                size_mb = info['size']/(1024**2)
+                mtime = datetime.fromtimestamp(info['mtime']).strftime('%d/%m/%Y %H:%M:%S')
+                
+                if info.get('checksum_valid') is True:
+                    print(f"  ✅ OK - {filename}")
+                    print(f"       📦 {size_mb:.2f} MB | 📅 {mtime}")
+                elif info.get('checksum_valid') is False:
+                    print(f"  ❌ CORROMPIDO - {filename}")
+                    print(f"       📦 {size_mb:.2f} MB | 📅 {mtime}")
+                    print(f"       🔑 Esperado: {info.get('historical_checksum', 'N/A')[:16]}...")
+                    print(f"       🔑 Atual:     {info['checksum'][:16]}...")
+                    print(f"       💡 Recomendação: Faça um novo backup imediatamente!")
+                else:
+                    print(f"  ⚠️ SEM HISTÓRICO - {filename}")
+                    print(f"       📦 {size_mb:.2f} MB | 📅 {mtime}")
+                    print(f"       🔑 Checksum: {info['checksum'][:16]}...")
+        else:
+            print("  ❌ Nenhum backup encontrado para verificar")
+    
+    def list_configs(self):
+        """Lista todas as configurações com detalhes"""
+        if not self.manager.configs:
+            print("\n❌ Nenhuma configuração encontrada")
+            return
+        
+        print("\n" + "="*70)
+        print("📋 CONFIGURAÇÕES DE BACKUP")
+        print("="*70)
+        
+        for i, cfg in enumerate(self.manager.configs, 1):
+            print(f"\n{i}. 📁 {cfg.name}")
+            print(f"   ┌─ 📂 Origem:")
+            for src in cfg.source_dirs:
+                print(f"   │    {src}")
+            print(f"   ├─ 🎯 Destino: {cfg.destination_type.value.upper()} -> {cfg.destination_path}")
+            print(f"   ├─ 📊 Tipo: {cfg.backup_type.value}")
+            print(f"   ├─ 🗜️ Compressão: {cfg.compression.value}")
+            print(f"   ├─ 🔐 Criptografia: {'Sim' if cfg.encryption_password else 'Não'}")
+            print(f"   ├─ 📅 Retenção: {cfg.retention_dias} dias / {cfg.max_backups} backups máximos")
+            
+            if cfg.exclude_patterns:
+                print(f"   ├─ 🚫 Exclusões:")
+                for pattern in cfg.exclude_patterns:
+                    print(f"   │    • {pattern}")
+            
+            # Estatísticas
+            if cfg.name in self.manager.history and self.manager.history[cfg.name]:
+                backups = self.manager.history[cfg.name]
+                successful = [b for b in backups if b.success]
+                if successful:
+                    total_size = sum(b.size_bytes for b in successful)
+                    avg_time = sum(b.duration_seconds for b in successful) / len(successful)
+                    compression_avg = sum(b.metadata.get('compression_ratio', 1) for b in successful) / len(successful)
+                    print(f"   └─ 📊 Estatísticas:")
+                    print(f"        • Total de backups: {len(successful)}")
+                    print(f"        • Espaço total: {total_size/(1024**3):.2f} GB")
+                    print(f"        • Tempo médio: {avg_time:.1f}s")
+                    print(f"        • Compressão média: {compression_avg:.2f}x")
+            else:
+                print(f"   └─ 📊 Nenhum backup executado ainda")
+    
+    def show_history(self):
+        """Mostra histórico detalhado de backups"""
+        if not self.manager.history:
+            print("\n📜 Nenhum histórico encontrado")
+            print("   Execute alguns backups primeiro (opção 2)")
+            return
+        
+        print("\n" + "="*70)
+        print("📜 HISTÓRICO DE BACKUPS")
+        print("="*70)
+        
+        for name, backups in self.manager.history.items():
+            print(f"\n📁 {name}:")
+            print("-" * 50)
+            
+            if not backups:
+                print("  Nenhum backup registrado")
+                continue
+            
+            # Estatísticas da configuração
+            successful = [b for b in backups if b.success]
+            failed = [b for b in backups if not b.success]
+            
+            total_size = sum(b.size_bytes for b in successful)
+            avg_duration = sum(b.duration_seconds for b in successful) / len(successful) if successful else 0
+            
+            print(f"  📊 Totais: {len(successful)} bem-sucedidos, {len(failed)} falhas")
+            print(f"  💾 Espaço total: {total_size/(1024**3):.2f} GB")
+            print(f"  ⏱️ Tempo médio: {avg_duration:.1f}s")
+            print()
+            
+            # Últimos 10 backups
+            print("  ÚLTIMOS 10 BACKUPS:")
+            for backup in backups[-10:]:
+                status = "✅" if backup.success else "❌"
+                size_mb = backup.size_bytes/(1024**2)
+                date_str = backup.timestamp.strftime('%d/%m/%Y %H:%M:%S')
+                print(f"    {status} {date_str} - {size_mb:.2f} MB - {backup.duration_seconds:.1f}s")
+                
+                if not backup.success and backup.error_message:
+                    print(f"       ⚠️ Erro: {backup.error_message[:80]}")
+            
+            if len(backups) > 10:
+                print(f"    ... e mais {len(backups)-10} backups (use --history-full para ver todos)")
+    
+    def remove_config_menu(self):
+        """Remove configuração"""
+        if not self.manager.configs:
+            print("\n❌ Nenhuma configuração encontrada")
+            return
+        
+        print("\n📋 CONFIGURAÇÕES DISPONÍVEIS:")
+        for i, cfg in enumerate(self.manager.configs, 1):
+            backup_count = len(self.manager.history.get(cfg.name, []))
+            print(f"  [{i}] {cfg.name} ({backup_count} backups no histórico)")
+        
+        choice = input("\n🔢 Número da configuração a remover: ").strip()
+        if not (choice.isdigit() and 1 <= int(choice) <= len(self.manager.configs)):
+            print("❌ Opção inválida")
+            return
+        
+        cfg = self.manager.configs[int(choice)-1]
+        
+        print(f"\n⚠️ ATENÇÃO: Você está prestes a remover a configuração '{cfg.name}'")
+        print(f"   Isso NÃO remove os arquivos de backup, apenas a configuração.")
+        confirm = input(f"   Confirmar remoção? (s/N): ").strip().lower()
+        
+        if confirm == 's':
+            self.manager.remove_config(cfg.name)
+            print(f"✅ Configuração '{cfg.name}' removida com sucesso")
+        else:
+            print("❌ Remoção cancelada")
+    
+    def schedule_menu(self):
+        """Menu de agendamento"""
+        print("\n" + "="*70)
+        print("📅 AGENDAMENTO DE BACKUP")
+        print("="*70)
+        
+        print("""
+╔═══════════════════════════════════════════════════════════════════════╗
+║  O agendamento deve ser feito usando o agendador do sistema:         ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+🔹 WINDOWS (Task Scheduler):
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ schtasks /create /tn "BackupMeuSite"                           │
+   │          /tr "python backup_system.py --run meu_site"          │
+   │          /sc daily /st 02:00                                   │
+   └─────────────────────────────────────────────────────────────────┘
+
+🔹 LINUX/MAC (cron):
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ crontab -e                                                     │
+   │ # Adicionar linha:                                             │
+   │ 0 2 * * * /usr/bin/python3 /caminho/backup_system.py --run all │
+   └─────────────────────────────────────────────────────────────────┘
+
+🔹 COMANDOS DISPONÍVEIS PARA AGENDAMENTO:
+   ┌─────────────────────────────────────────────────────────────────┐
+   │ --run <nome>     Executa backup específico                     │
+   │ --run-all        Executa todos os backups                      │
+   │ --list           Lista configurações                           │
+   │ --verify <nome>  Verifica integridade dos backups              │
+   │ --report         Gera relatório de status                      │
+   └─────────────────────────────────────────────────────────────────┘
+
+📝 EXEMPLOS PRÁTICOS:
+   python backup_system.py --run meu_site
+   python backup_system.py --run-all
+   python backup_system.py --list
+   python backup_system.py --verify meu_site
+""")
+        
+        # Opção de criar script de execução
+        create_script = input("\n📝 Criar script de execução para agendamento? (s/N): ").strip().lower()
+        if create_script == 's':
+            script_name = input("   Nome do script (padrão: run_backup): ").strip() or "run_backup"
+            
+            if sys.platform == 'win32':
+                script_file = f"{script_name}.bat"
+                log_file = f"{script_name}.log"
+                with open(script_file, 'w') as f:
+                    f.write('@echo off\n')
+                    f.write(f'echo %date% %time% - Iniciando rotina de backups >> {log_file}\n')
+                    f.write(f'echo ======================================== >> {log_file}\n')
+                    for cfg in self.manager.configs:
+                        f.write(f'echo %date% %time% - Executando backup {cfg.name} >> {log_file}\n')
+                        f.write(f'python "{sys.argv[0]}" --run {cfg.name} >> {log_file} 2>&1\n')
+                        f.write(f'if %errorlevel% neq 0 (\n')
+                        f.write(f'  echo %date% %time% - ERRO no backup {cfg.name} >> {log_file}\n')
+                        f.write(f') else (\n')
+                        f.write(f'  echo %date% %time% - SUCESSO no backup {cfg.name} >> {log_file}\n')
+                        f.write(f')\n')
+                    f.write(f'echo ======================================== >> {log_file}\n')
+                    f.write(f'echo %date% %time% - Rotina concluída >> {log_file}\n')
+                
+                print(f"\n✅ Script criado: {script_file}")
+                print(f"   Para agendar no Windows Task Scheduler:")
+                print(f"   schtasks /create /tn \"BackupRotina\" /tr \"{os.path.abspath(script_file)}\" /sc daily /st 02:00")
+            
+            else:
+                script_file = f"{script_name}.sh"
+                log_file = f"{script_name}.log"
+                with open(script_file, 'w') as f:
+                    f.write('#!/bin/bash\n')
+                    f.write(f'echo "$(date) - Iniciando rotina de backups" >> {log_file}\n')
+                    f.write(f'echo "========================================" >> {log_file}\n')
+                                  f.write(f'echo "========================================" >> {log_file}\n')
+                        f.write(f'echo "$(date) - Rotina concluída" >> {log_file}\n')
+                
+                # Tornar executável
+                os.chmod(script_file, 0o755)
+                
+                print(f"\n✅ Script criado: {script_file}")
+                print(f"   Para agendar no crontab:")
+                print(f"   crontab -e")
+                print(f"   # Adicionar: 0 2 * * * {os.path.abspath(script_file)}")
+            
+            print(f"\n📁 Logs serão salvos em: {log_file}")
+
+
+# ============================================================================
+# COMMAND LINE ARGUMENTS
+# ============================================================================
+
+def parse_args():
+    """Parse argumentos de linha de comando para agendamento"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Secure Backup System - Backup seguro com criptografia AES-256',
+        epilog='Exemplos:\n'
+               '  %(prog)s --run meu_site\n'
+               '  %(prog)s --run-all\n'
+               '  %(prog)s --list\n'
+               '  %(prog)s --verify meu_site\n'
+               '  %(prog)s --report'
+    )
+    parser.add_argument('--run', type=str, metavar='NOME', 
+                       help='Executar backup específico pelo nome')
+    parser.add_argument('--run-all', action='store_true', 
+                       help='Executar todos os backups configurados')
+    parser.add_argument('--list', action='store_true', 
+                       help='Listar todas as configurações de backup')
+    parser.add_argument('--verify', type=str, metavar='NOME',
+                       help='Verificar integridade dos backups de uma configuração')
+    parser.add_argument('--verify-all', action='store_true',
+                       help='Verificar integridade de todos os backups')
+    parser.add_argument('--report', action='store_true', 
+                       help='Gerar relatório de status')
+    parser.add_argument('--interactive', action='store_true', 
+                       help='Modo interativo (padrão se nenhum argumento)')
+    
+    return parser.parse_args()
+
+
+def generate_status_report(manager: BackupManager):
+    """Gera relatório de status para monitoramento"""
+    print("\n" + "="*70)
+    print(f"📊 RELATÓRIO DE STATUS - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    print("="*70)
+    
+    total_backups = len(manager.configs)
+    healthy_count = 0
+    warning_count = 0
+    critical_count = 0
+    
+    for cfg in manager.configs:
+        print(f"\n📁 {cfg.name}")
+        print(f"   📂 Origem: {', '.join(cfg.source_dirs)}")
+        print(f"   🎯 Destino: {cfg.destination_path}")
+        
+        if cfg.name in manager.history and manager.history[cfg.name]:
+            backups = manager.history[cfg.name]
+            successful = [b for b in backups if b.success]
+            
+            if successful:
+                last = successful[-1]
+                time_since = (datetime.now() - last.timestamp).total_seconds() / 3600
+                size_gb = last.size_bytes / (1024**3)
+                
+                print(f"   ✅ Último backup bem-sucedido: {last.timestamp.strftime('%d/%m/%Y %H:%M:%S')}")
+                print(f"   ⏱️ Há {time_since:.1f} horas")
+                print(f"   📦 Tamanho: {size_gb:.2f} GB" if size_gb >= 1 else f"   📦 Tamanho: {last.size_bytes/(1024**2):.2f} MB")
+                print(f"   ⏱️ Duração: {last.duration_seconds:.1f} segundos")
+                
+                # Verificar saúde
+                if time_since > 48:
+                    print(f"   ⚠️ ATENÇÃO: Último backup há mais de 48 horas!")
+                    warning_count += 1
+                else:
+                    healthy_count += 1
+                
+                # Verificar integridade do último backup (apenas para destino local)
+                if cfg.destination_type == DestinationType.LOCAL and cfg.verify_integrity:
+                    dest_file = last.destination_path
+                    if os.path.exists(dest_file):
+                        current_checksum = CryptoUtils.calculate_checksum(dest_file)
+                        if current_checksum == last.checksum:
+                            print(f"   🔒 Integridade: OK")
+                        else:
+                            print(f"   ❌ INTEGRIDADE: CORROMPIDO!")
+                            critical_count += 1
+                    else:
+                        print(f"   ❌ Arquivo de backup não encontrado!")
+                        critical_count += 1
+            else:
+                print(f"   ❌ Nenhum backup bem-sucedido encontrado")
+                critical_count += 1
+        else:
+            print(f"   ❌ Nenhum backup realizado")
+            critical_count += 1
+    
+    # Resumo final
+    print("\n" + "="*70)
+    print("📊 RESUMO GERAL")
+    print("="*70)
+    print(f"   Total de configurações: {total_backups}")
+    print(f"   🟢 Saudáveis: {healthy_count}")
+    print(f"   🟡 Atenção: {warning_count}")
+    print(f"   🔴 Crítico: {critical_count}")
+    
+    if critical_count > 0:
+        print("\n⚠️ Ações recomendadas:")
+        if critical_count == total_backups:
+            print("   • Execute backups imediatamente para todas as configurações")
+        else:
+            print("   • Verifique as configurações com status crítico")
+            print("   • Execute backups manuais para restaurar a saúde")
+    
+    print("="*70)
+
+
+def generate_html_report(manager: BackupManager, output_file: str = "backup_report.html"):
+    """Gera relatório HTML detalhado"""
+    
+    html = f'''<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Relatório de Backup - {datetime.now().strftime('%d/%m/%Y')}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            padding: 20px;
+            color: #eee;
+        }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        
+        .header {{
+            background: linear-gradient(135deg, #0f3460 0%, #1a1a2e 100%);
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            text-align: center;
+        }}
+        .header h1 {{ color: #00d4ff; margin-bottom: 10px; }}
+        
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .stat-card {{
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+        }}
+        .stat-card .number {{ font-size: 2em; font-weight: bold; color: #00d4ff; }}
+        
+        .config-card {{
+            background: rgba(255,255,255,0.05);
+            border-radius: 15px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }}
+        .config-header {{
+            background: rgba(0,212,255,0.1);
+            padding: 15px 20px;
+            cursor: pointer;
+        }}
+        .config-name {{ font-size: 1.2em; font-weight: bold; }}
+        .status-ok {{ color: #28a745; }}
+        .status-warning {{ color: #ffc107; }}
+        .status-critical {{ color: #dc3545; }}
+        
+        .config-body {{ padding: 20px; display: none; }}
+        .config-body.show {{ display: block; }}
+        
+        .backup-item {{
+            background: rgba(0,0,0,0.3);
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 5px;
+        }}
+        
+        button {{
+            background: #00d4ff;
+            border: none;
+            padding: 5px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+        }}
+        
+        .footer {{
+            text-align: center;
+            margin-top: 30px;
+            padding: 20px;
+            opacity: 0.6;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 Secure Backup System</h1>
+            <p>Relatório de Backup - {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
+        </div>
+'''
+    
+    # Estatísticas
+    total_configs = len(manager.configs)
+    total_backups = sum(len(manager.history.get(cfg.name, [])) for cfg in manager.configs)
+    total_size = sum(b.size_bytes for cfg in manager.configs for b in manager.history.get(cfg.name, []) if b.success)
+    
+    html += f'''
+        <div class="stats-grid">
+            <div class="stat-card"><div class="number">{total_configs}</div><div>Configurações</div></div>
+            <div class="stat-card"><div class="number">{total_backups}</div><div>Total de Backups</div></div>
+            <div class="stat-card"><div class="number">{total_size/(1024**3):.1f}</div><div>Espaço Total (GB)</div></div>
+        </div>
+'''
+    
+    # Configurações
+    for i, cfg in enumerate(manager.configs):
+        backups = manager.history.get(cfg.name, [])
+        successful = [b for b in backups if b.success]
+        last_backup = successful[-1] if successful else None
+        
+        status_class = "status-ok" if last_backup and (datetime.now() - last_backup.timestamp).total_seconds() < 86400 else "status-critical"
+        
+        html += f'''
+        <div class="config-card">
+            <div class="config-header" onclick="toggleConfig({i})">
+                <div class="config-name">
+                    📁 {cfg.name}
+                    <span class="{status_class}">
+                        {'✅ OK' if last_backup and (datetime.now() - last_backup.timestamp).total_seconds() < 86400 else '⚠️ ATENÇÃO'}
+                    </span>
+                </div>
+                <div>Último backup: {last_backup.timestamp.strftime('%d/%m/%Y %H:%M') if last_backup else 'Nunca'}</div>
+            </div>
+            <div class="config-body" id="config-{i}">
+                <p><strong>📂 Origem:</strong> {', '.join(cfg.source_dirs)}</p>
+                <p><strong>🎯 Destino:</strong> {cfg.destination_path}</p>
+                <p><strong>🗜️ Compressão:</strong> {cfg.compression.value}</p>
+                <p><strong>🔐 Criptografia:</strong> {'Sim' if cfg.encryption_password else 'Não'}</p>
+                <p><strong>📅 Retenção:</strong> {cfg.retention_days} dias / {cfg.max_backups} backups</p>
+                
+                <h4>📜 Histórico de Backups:</h4>
+'''
+        
+        for backup in backups[-10:]:
+            status = "✅" if backup.success else "❌"
+            size_mb = backup.size_bytes/(1024**2)
+            html += f'''
+                <div class="backup-item">
+                    {status} {backup.timestamp.strftime('%d/%m/%Y %H:%M:%S')} - {size_mb:.2f} MB - {backup.duration_seconds:.1f}s
+                </div>
+'''
+        
+        html += '''
+            </div>
+        </div>
+'''
+    
+    html += f'''
+        <div class="footer">
+            <p>Relatório gerado automaticamente pelo Secure Backup System</p>
+        </div>
+    </div>
+    
+    <script>
+        function toggleConfig(id) {
+            const element = document.getElementById('config-' + id);
+            element.classList.toggle('show');
+        }
+    </script>
+</body>
+</html>
+'''
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(html)
+    
+    print(f"📊 Relatório HTML gerado: {output_file}")
+    return output_file
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Função principal"""
+    
+    # Verificar dependências
+    missing = []
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        missing.append("pycryptodome")
+    
+    if missing:
+        print(f"\n[!] Dependências faltando: {', '.join(missing)}")
+        print(f"Instale com: pip install {' '.join(missing)}")
+        print("\nPara funcionalidades adicionais (opcionais):")
+        print("  pip install boto3     # Para backup AWS S3")
+        print("  pip install paramiko  # Para backup SFTP")
+        print("  pip install requests  # Para WebDAV")
+        return
+    
+    # Parse argumentos de linha de comando
+    args = parse_args()
+    
+    # Criar diretório de configuração se não existir
+    config_dir = os.path.expanduser("~/.secure_backup")
+    os.makedirs(config_dir, exist_ok=True)
+    
+    config_path = os.path.join(config_dir, "backup_configs.json")
+    manager = BackupManager(config_path)
+    manager.load_history()
+    
+    # Modo de linha de comando (para agendamento)
+    if args.run:
+        print(f"\n🚀 Iniciando backup: {args.run}")
+        result = manager.run_backup(args.run)
+        sys.exit(0 if result.success else 1)
+    
+    elif args.run_all:
+        print(f"\n🚀 Executando todos os backups...")
+        results = []
+        for cfg in manager.configs:
+            result = manager.run_backup(cfg.name)
+            results.append(result)
+        success_count = sum(1 for r in results if r.success)
+        print(f"\n📊 Resumo: {success_count}/{len(results)} backups bem-sucedidos")
+        sys.exit(0 if success_count == len(results) else 1)
+    
+    elif args.list:
+        cli = BackupCLI()
+        cli.list_configs()
+        return
+    
+    elif args.verify:
+        if args.verify == 'all' or args.verify_all:
+            print("\n🔍 Verificando todos os backups...")
+            for cfg in manager.configs:
+                results = manager.verify_backup(cfg.name)
+                print(f"\n📋 {cfg.name}: {len(results)} backups verificados")
+                for filename, info in results.items():
+                    status = "✅ OK" if info.get('checksum_valid', True) else "❌ CORROMPIDO"
+                    print(f"  {status} - {filename}")
+        else:
+            print(f"\n🔍 Verificando backups para '{args.verify}'...")
+            results = manager.verify_backup(args.verify)
+            if results:
+                for filename, info in results.items():
+                    status = "✅ OK" if info.get('checksum_valid', True) else "❌ CORROMPIDO"
+                    size_mb = info['size']/(1024**2)
+                    print(f"  {status} - {filename} ({size_mb:.2f} MB)")
+            else:
+                print("  Nenhum backup encontrado")
+        return
+    
+    elif args.report:
+        generate_status_report(manager)
+        generate_html_report(manager)
+        return
+    
+    # Modo interativo padrão
+    cli = BackupCLI()
+    cli.run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] Encerrado pelo usuário")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n[!] Erro: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
